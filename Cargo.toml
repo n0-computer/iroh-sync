@@ -10,4 +10,6 @@ repository = "https://github.com/n0-computer/iroh-sync"
 
 [dependencies]
 blake3 = "1.3.3"
+crossbeam = "0.8.2"
+once_cell = "1.18.0"
 url = "2.4.0"

@@ -1,9 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
+    sync::Mutex,
 };
 
 use blake3::Hash;
+use crossbeam::channel;
+use once_cell::sync::Lazy;
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -116,20 +119,41 @@ impl Blob {
     }
 }
 
+static PEERS: Lazy<Mutex<HashMap<Url, Peer>>> = Lazy::new(|| HashMap::new().into());
+struct Peer {
+    connections: Vec<(channel::Sender<PeerMessage>, channel::Receiver<PeerMessage>)>,
+}
+
 pub struct Syncer {
     // TODO: multiple?
     peer: Url,
     auth: AuthorKeypair,
+    connection: Option<(channel::Sender<PeerMessage>, channel::Receiver<PeerMessage>)>,
     synced_collections: HashSet<Collection>,
 }
+
+enum PeerMessage {}
 
 impl Syncer {
     pub fn builder() -> SyncerBuilder {
         SyncerBuilder::default()
     }
 
+    pub fn connect(&mut self) {
+        // TODO: actually dial the peer
+        let mut l = PEERS.lock().unwrap();
+        let peer = l.entry(self.peer.clone()).or_insert_with(|| Peer {
+            connections: Vec::new(),
+        });
+        let (s0, r0) = channel::unbounded();
+        let (s1, r1) = channel::unbounded();
+
+        peer.connections.push((s0, r1));
+        self.connection = Some((s1, r0));
+    }
+
     pub fn watcher(&self) -> Watcher {
-        Watcher {}
+        todo!()
     }
 
     pub fn sync_collection(&mut self, collection: &Collection) {
@@ -137,11 +161,13 @@ impl Syncer {
     }
 }
 
-pub struct Watcher {}
+pub struct Watcher {
+    receiver: channel::Receiver<Change>,
+}
 
 impl Watcher {
     pub fn next(&self) -> Option<Change> {
-        todo!()
+        self.receiver.recv().ok()
     }
 }
 
@@ -165,12 +191,16 @@ impl SyncerBuilder {
         self
     }
 
-    pub fn build(mut self) -> Syncer {
-        Syncer {
+    pub fn build(self) -> Syncer {
+        let mut syncer = Syncer {
             peer: self.peer.expect("missing peer"),
             auth: self.auth.expect("missing auth"),
             synced_collections: Default::default(),
-        }
+            connection: None,
+        };
+
+        syncer.connect();
+        syncer
     }
 }
 
