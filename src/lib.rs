@@ -1,82 +1,139 @@
-use std::fmt::Display;
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+};
 
 use blake3::Hash;
+use url::Url;
 
-pub struct AuthorKeypair {}
+#[derive(Debug, Clone)]
+pub struct AuthorKeypair {
+    name: String,
+}
 
 impl AuthorKeypair {
     pub fn new(name: impl AsRef<str>) -> Self {
-        todo!()
+        AuthorKeypair {
+            name: name.as_ref().into(),
+        }
     }
 }
 
-pub struct Collection {}
+impl Display for AuthorKeypair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "author:{}", self.name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collection {
+    name: String,
+    blobs: HashMap<String, Blob>,
+}
+
+impl std::hash::Hash for Collection {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write(self.name.as_bytes());
+    }
+}
 
 impl Display for Collection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
+        write!(f, "collection:{}", self.name)
     }
 }
 
 impl Collection {
     pub fn new(name: impl AsRef<str>) -> Self {
-        todo!()
+        Collection {
+            name: name.as_ref().into(),
+            blobs: HashMap::default(),
+        }
     }
 
-    pub fn insert(&mut self, blob_name: impl AsRef<str>) -> BlobBuilder {
-        todo!()
+    pub fn insert(&mut self, blob_builder: BlobBuilder) -> Blob {
+        let blob = blob_builder.build(self);
+        self.blobs.insert(blob.name().into(), blob.clone());
+        blob
     }
 
-    pub fn all(&self) -> Vec<&Blob> {
-        todo!()
+    pub fn all(&self) -> impl Iterator<Item = &Blob> {
+        self.blobs.values()
     }
 }
 
-pub struct BlobBuilder {}
+pub struct BlobBuilder {
+    name: String,
+    content: Vec<u8>,
+}
 
 impl BlobBuilder {
+    pub fn new(name: impl AsRef<str>) -> Self {
+        BlobBuilder {
+            name: name.as_ref().into(),
+            content: Vec::new(),
+        }
+    }
     pub fn content(mut self, content: impl AsRef<[u8]>) -> Self {
-        todo!()
+        self.content = content.as_ref().to_vec();
+        self
     }
 
-    pub fn build(self) -> Blob {
-        todo!()
+    pub fn build(self, collection: &Collection) -> Blob {
+        let hash = blake3::hash(&self.content);
+        Blob {
+            name: self.name,
+            collection: collection.clone(),
+            content: self.content,
+            hash,
+        }
     }
 }
 
-pub struct Blob {}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Blob {
+    name: String,
+    collection: Collection,
+    content: Vec<u8>,
+    hash: Hash,
+}
 
 impl Blob {
     pub fn collection(&self) -> &Collection {
-        todo!()
+        &self.collection
     }
 
     pub fn name(&self) -> &str {
-        todo!()
+        &self.name
     }
 
     pub fn hash(&self) -> Hash {
-        todo!()
+        self.hash
     }
 
     pub fn set_content(&mut self, content: impl AsRef<[u8]>) {
-        todo!()
+        self.content = content.as_ref().to_vec();
     }
 }
 
-pub struct Syncer {}
+pub struct Syncer {
+    // TODO: multiple?
+    peer: Url,
+    auth: AuthorKeypair,
+    synced_collections: HashSet<Collection>,
+}
 
 impl Syncer {
     pub fn builder() -> SyncerBuilder {
-        todo!()
+        SyncerBuilder::default()
     }
 
     pub fn watcher(&self) -> Watcher {
-        todo!()
+        Watcher {}
     }
 
-    pub fn sync_collection(&self, collection: &Collection) {
-        todo!()
+    pub fn sync_collection(&mut self, collection: &Collection) {
+        self.synced_collections.insert(collection.clone());
     }
 }
 
@@ -91,19 +148,29 @@ impl Watcher {
 #[derive(Debug)]
 pub struct Change {}
 
-pub struct SyncerBuilder {}
+#[derive(Default)]
+pub struct SyncerBuilder {
+    peer: Option<Url>,
+    auth: Option<AuthorKeypair>,
+}
 
 impl SyncerBuilder {
     pub fn peer(mut self, url: impl AsRef<str>) -> Self {
-        todo!()
+        self.peer = Some(url.as_ref().parse().expect("invalid url"));
+        self
     }
 
     pub fn auth(mut self, keypair: &AuthorKeypair) -> Self {
-        todo!()
+        self.auth = Some(keypair.clone());
+        self
     }
 
     pub fn build(mut self) -> Syncer {
-        todo!()
+        Syncer {
+            peer: self.peer.expect("missing peer"),
+            auth: self.auth.expect("missing auth"),
+            synced_collections: Default::default(),
+        }
     }
 }
 
@@ -120,10 +187,9 @@ mod tests {
         let mut collection = Collection::new("demo");
 
         // Create a blob
-        let mut blob = collection
-            .insert("/notes/cool-bear-hello") // creates a BlobBuilder
-            .content(b"hello world from cool-bear") // content
-            .build();
+        let blob_builder =
+            BlobBuilder::new("/notes/cool-bear-hello").content(b"hello world from cool-bear");
+        let mut blob = collection.insert(blob_builder);
 
         println!(
             "created blob {}/{}: {}",
@@ -134,7 +200,7 @@ mod tests {
         // => created blob +chatting.b..../notes/cool-bear-hello: b....
 
         // Setup a connection to a sync node
-        let syncer = Syncer::builder()
+        let mut syncer = Syncer::builder()
             .peer("https://demo.iroh.computer")
             .auth(&author_keypair) // authenticate via the author keypair (could be a different key)
             .build();
