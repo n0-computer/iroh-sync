@@ -4,7 +4,7 @@ use std::fmt::Debug;
 use std::ops::Bound;
 
 #[derive(Debug, Clone, PartialEq)]
-enum Range<K> {
+pub enum Range<K> {
     /// All elements in a set, denoted with x, y: x = y
     All(K),
     /// [x, y): x < y
@@ -46,7 +46,7 @@ where
 }
 
 #[derive(Copy, Clone, PartialEq)]
-struct Fingerprint([u8; 32]);
+pub struct Fingerprint([u8; 32]);
 
 impl Debug for Fingerprint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -74,25 +74,25 @@ impl std::ops::BitXorAssign for Fingerprint {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct RangeFingerprint<K> {
-    range: Range<K>,
+pub struct RangeFingerprint<K> {
+    pub range: Range<K>,
     /// The fingerprint of `range`.
-    fingerprint: Fingerprint,
+    pub fingerprint: Fingerprint,
 }
 
 /// Transfers items inside a range to the other participant.
 #[derive(Debug, Clone, PartialEq)]
-struct RangeItem<K, V> {
+pub struct RangeItem<K, V> {
     /// The range out of which the elements are.
-    range: Range<K>,
-    values: Vec<(K, V)>,
+    pub range: Range<K>,
+    pub values: Vec<(K, V)>,
     /// If false, requests to send local items in the range.
     /// Otherwise not.
-    have_local: bool,
+    pub have_local: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum MessagePart<K, V> {
+pub enum MessagePart<K, V> {
     RangeFingerprint(RangeFingerprint<K>),
     RangeItem(RangeItem<K, V>),
 }
@@ -104,6 +104,13 @@ impl<K, V> MessagePart<K, V> {
 
     pub fn is_range_item(&self) -> bool {
         matches!(self, MessagePart::RangeItem(_))
+    }
+
+    pub fn values(&self) -> Option<&[(K, V)]> {
+        match self {
+            MessagePart::RangeFingerprint(_) => None,
+            MessagePart::RangeItem(RangeItem { values, .. }) => Some(&values),
+        }
     }
 }
 
@@ -123,6 +130,10 @@ where
         let fingerprint = store.get_fingerprint(&range);
         let part = MessagePart::RangeFingerprint(RangeFingerprint { range, fingerprint });
         Message { parts: vec![part] }
+    }
+
+    pub fn parts(&self) -> &[MessagePart<K, V>] {
+        &self.parts
     }
 }
 
@@ -307,7 +318,6 @@ where
                 let mut ranges = Vec::with_capacity(self.split_factor);
                 let chunk_len = div_ceil(local_values.len(), self.split_factor);
 
-                dbg!(&local_values, local_values.len(), chunk_len);
                 for i in 0..self.split_factor {
                     let (x, y) = if i == 0 {
                         // first
@@ -387,7 +397,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_paper() {
+    fn test_paper_1() {
         let alice_set = [("ape", 1), ("eel", 1), ("fox", 1), ("gnu", 1)];
         let bob_set = [
             ("bee", 1),
@@ -425,6 +435,56 @@ mod tests {
         res.print_messages();
     }
 
+    #[test]
+    fn test_paper_2() {
+        let alice_set = [
+            ("ape", 1),
+            ("bee", 1),
+            ("cat", 1),
+            ("doe", 1),
+            ("eel", 1),
+            ("fox", 1), // the only value being sent
+            ("gnu", 1),
+            ("hog", 1),
+        ];
+        let bob_set = [
+            ("ape", 1),
+            ("bee", 1),
+            ("cat", 1),
+            ("doe", 1),
+            ("eel", 1),
+            ("gnu", 1),
+            ("hog", 1),
+        ];
+
+        let res = sync(&alice_set, &bob_set);
+        assert_eq!(res.alice_to_bob.len(), 3, "A -> B message count");
+        assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
+
+        res.print_messages();
+    }
+
+    #[test]
+    fn test_paper_3() {
+        let alice_set = [
+            ("ape", 1),
+            ("bee", 1),
+            ("cat", 1),
+            ("doe", 1),
+            ("eel", 1),
+            ("fox", 1),
+            ("gnu", 1),
+            ("hog", 1),
+        ];
+        let bob_set = [("ape", 1), ("cat", 1), ("eel", 1), ("gnu", 1)];
+
+        let res = sync(&alice_set, &bob_set);
+        assert_eq!(res.alice_to_bob.len(), 3, "A -> B message count");
+        assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
+
+        res.print_messages();
+    }
+
     struct SyncResult<V> {
         alice: Peer<String, V>,
         bob: Peer<String, V>,
@@ -440,10 +500,43 @@ mod tests {
             let len = std::cmp::max(self.alice_to_bob.len(), self.bob_to_alice.len());
             for i in 0..len {
                 if let Some(msg) = self.alice_to_bob.get(i) {
-                    println!("A -> B: {:?}", msg);
+                    println!("A -> B:");
+                    print_message(msg);
                 }
                 if let Some(msg) = self.bob_to_alice.get(i) {
-                    println!("B -> A: {:?}", msg);
+                    println!("B -> A:");
+                    print_message(msg);
+                }
+            }
+        }
+    }
+
+    fn print_message<V>(msg: &Message<String, V>)
+    where
+        V: Debug,
+    {
+        for part in &msg.parts {
+            match part {
+                MessagePart::RangeFingerprint(RangeFingerprint { range, fingerprint }) => {
+                    println!(
+                        "  RangeFingerprint({}, {}, {:?})",
+                        range.x(),
+                        range.y(),
+                        fingerprint
+                    );
+                }
+                MessagePart::RangeItem(RangeItem {
+                    range,
+                    values,
+                    have_local,
+                }) => {
+                    println!(
+                        "  RangeItem({} | {}) (local?: {})\n  {:?}",
+                        range.x(),
+                        range.y(),
+                        have_local,
+                        values,
+                    );
                 }
             }
         }
@@ -472,12 +565,13 @@ mod tests {
         let initial_message = alice.initial_message();
 
         let mut next_to_bob = Some(initial_message);
+        let mut rounds = 0;
         while let Some(msg) = next_to_bob.take() {
-            println!("A -> B: {:#?}", msg);
+            assert!(rounds < 100, "too many rounds");
+            rounds += 1;
             alice_to_bob.push(msg.clone());
 
             if let Some(msg) = bob.process_message(msg) {
-                println!("B -> A: {:#?}", msg);
                 bob_to_alice.push(msg.clone());
                 next_to_bob = alice.process_message(msg);
             }
@@ -487,6 +581,39 @@ mod tests {
 
         let bob_now: Vec<_> = bob.all().collect();
         assert_eq!(expected_set.iter().collect::<Vec<_>>(), bob_now, "bob");
+
+        // Check that values were never sent twice
+        let mut alice_sent = BTreeMap::new();
+        for msg in &alice_to_bob {
+            for part in &msg.parts {
+                if let Some(values) = part.values() {
+                    for (key, value) in values {
+                        assert!(
+                            alice_sent.insert(key.clone(), value.clone()).is_none(),
+                            "alice: duplicate {:?} - {:?}",
+                            key,
+                            value
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut bob_sent = BTreeMap::new();
+        for msg in &bob_to_alice {
+            for part in &msg.parts {
+                if let Some(values) = part.values() {
+                    for (key, value) in values {
+                        assert!(
+                            bob_sent.insert(key.clone(), value.clone()).is_none(),
+                            "bob: duplicate {:?} - {:?}",
+                            key,
+                            value
+                        );
+                    }
+                }
+            }
+        }
 
         SyncResult {
             alice,
