@@ -1,3 +1,7 @@
+//! Implementation of Set Reconcilliation based on
+//! "Range-Based Set Reconciliation" by Aljoscha Meyer.
+//!
+
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
