@@ -97,6 +97,16 @@ enum MessagePart<K, V> {
     RangeItem(RangeItem<K, V>),
 }
 
+impl<K, V> MessagePart<K, V> {
+    pub fn is_range_fingerprint(&self) -> bool {
+        matches!(self, MessagePart::RangeFingerprint(_))
+    }
+
+    pub fn is_range_item(&self) -> bool {
+        matches!(self, MessagePart::RangeItem(_))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message<K, V> {
     parts: Vec<MessagePart<K, V>>,
@@ -198,7 +208,7 @@ impl<K, V> Default for Peer<K, V> {
     fn default() -> Self {
         Peer {
             store: Store::default(),
-            max_set_size: 2,
+            max_set_size: 1,
             split_factor: 2,
         }
     }
@@ -206,8 +216,8 @@ impl<K, V> Default for Peer<K, V> {
 
 impl<K, V> Peer<K, V>
 where
-    K: PartialEq + Ord + Clone + AsRef<[u8]> + Default,
-    V: Clone,
+    K: PartialEq + Ord + Clone + AsRef<[u8]> + Default + Debug,
+    V: Clone + Debug,
 {
     /// Generates the initial message.
     pub fn initial_message(&self) -> Message<K, V> {
@@ -295,7 +305,9 @@ where
                 // m0 = x < m1 < .. < mk = y, with k>= 2
                 // such that [ml, ml+1) is nonempty
                 let mut ranges = Vec::with_capacity(self.split_factor);
-                let chunk_len = local_values.len() / self.split_factor;
+                let chunk_len = div_ceil(local_values.len(), self.split_factor);
+
+                dbg!(&local_values, local_values.len(), chunk_len);
                 for i in 0..self.split_factor {
                     let (x, y) = if i == 0 {
                         // first
@@ -314,10 +326,8 @@ where
                     ranges.push(range);
                 }
 
-                for (range, chunk) in ranges
-                    .into_iter()
-                    .zip(local_values.chunks(self.split_factor))
-                {
+                for range in ranges.into_iter() {
+                    let chunk = self.store.get_range(&range);
                     // Add either the fingerprint or the item set
                     let fingerprint = self.store.get_fingerprint(&range);
                     if chunk.len() > self.max_set_size {
@@ -331,8 +341,8 @@ where
                             values: chunk
                                 .into_iter()
                                 .map(|(k, v)| {
-                                    let k: K = k.clone().clone();
-                                    let v: V = v.clone().clone();
+                                    let k: K = k.clone();
+                                    let v: V = v.clone();
                                     (k, v)
                                 })
                                 .collect(),
@@ -362,6 +372,14 @@ where
     }
 }
 
+/// Sadly https://doc.rust-lang.org/std/primitive.usize.html#method.div_ceil is still unstable..
+fn div_ceil(a: usize, b: usize) -> usize {
+    debug_assert!(a != 0);
+    debug_assert!(b != 0);
+
+    a / b + (a % b != 0) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Debug;
@@ -381,6 +399,30 @@ mod tests {
         ];
 
         let res = sync(&alice_set, &bob_set);
+        assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
+        assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
+
+        // Initial message
+        assert_eq!(res.alice_to_bob[0].parts.len(), 1);
+        assert!(res.alice_to_bob[0].parts[0].is_range_fingerprint());
+
+        // Response from Bob - recurse once
+        assert_eq!(res.bob_to_alice[0].parts.len(), 2);
+        assert!(res.bob_to_alice[0].parts[0].is_range_fingerprint());
+        assert!(res.bob_to_alice[0].parts[1].is_range_fingerprint());
+
+        // Last response from Alice
+        assert_eq!(res.alice_to_bob[1].parts.len(), 3);
+        assert!(res.alice_to_bob[1].parts[0].is_range_item());
+        assert!(res.alice_to_bob[1].parts[1].is_range_fingerprint());
+        assert!(res.alice_to_bob[1].parts[2].is_range_item());
+
+        // Last response from Bob
+        assert_eq!(res.bob_to_alice[1].parts.len(), 2);
+        assert!(res.bob_to_alice[1].parts[0].is_range_item());
+        assert!(res.bob_to_alice[1].parts[1].is_range_item());
+
+        res.print_messages();
     }
 
     struct SyncResult<V> {
@@ -388,6 +430,23 @@ mod tests {
         bob: Peer<String, V>,
         alice_to_bob: Vec<Message<String, V>>,
         bob_to_alice: Vec<Message<String, V>>,
+    }
+
+    impl<V> SyncResult<V>
+    where
+        V: Debug,
+    {
+        fn print_messages(&self) {
+            let len = std::cmp::max(self.alice_to_bob.len(), self.bob_to_alice.len());
+            for i in 0..len {
+                if let Some(msg) = self.alice_to_bob.get(i) {
+                    println!("A -> B: {:?}", msg);
+                }
+                if let Some(msg) = self.bob_to_alice.get(i) {
+                    println!("B -> A: {:?}", msg);
+                }
+            }
+        }
     }
 
     fn sync<V>(alice_set: &[(&str, V)], bob_set: &[(&str, V)]) -> SyncResult<V>
@@ -418,7 +477,7 @@ mod tests {
             alice_to_bob.push(msg.clone());
 
             if let Some(msg) = bob.process_message(msg) {
-                println!("A -> B: {:#?}", msg);
+                println!("B -> A: {:#?}", msg);
                 bob_to_alice.push(msg.clone());
                 next_to_bob = alice.process_message(msg);
             }
@@ -487,7 +546,7 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
-        dbg!(&excluded);
+
         assert_eq!(excluded.len(), 2);
         assert_eq!(excluded[0].0, "fox");
         assert_eq!(excluded[1].0, "hog");
@@ -497,11 +556,21 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
-        dbg!(&excluded);
+
         assert_eq!(excluded.len(), 4);
         assert_eq!(excluded[0].0, "fox");
         assert_eq!(excluded[1].0, "hog");
         assert_eq!(excluded[2].0, "bee");
         assert_eq!(excluded[3].0, "cat");
+    }
+
+    #[test]
+    fn test_div_ceil() {
+        assert_eq!(div_ceil(1, 1), 1 / 1);
+        assert_eq!(div_ceil(2, 1), 2 / 1);
+        assert_eq!(div_ceil(4, 2), 4 / 2);
+
+        assert_eq!(div_ceil(3, 2), 2);
+        assert_eq!(div_ceil(5, 3), 2);
     }
 }
