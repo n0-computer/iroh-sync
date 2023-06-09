@@ -237,14 +237,14 @@ where
             Range::Exclusion(x, y) => {
                 if let Some(limit) = limit {
                     self.data
-                        .range((Bound::Included(x), Bound::Unbounded))
-                        .chain(self.data.range((Bound::Unbounded, Bound::Excluded(y))))
+                        .range((Bound::Unbounded, Bound::Excluded(y)))
+                        .chain(self.data.range((Bound::Included(x), Bound::Unbounded)))
                         .filter(|(k, _)| limit.contains(k))
                         .collect()
                 } else {
                     self.data
-                        .range((Bound::Included(x), Bound::Unbounded))
-                        .chain(self.data.range((Bound::Unbounded, Bound::Excluded(y))))
+                        .range((Bound::Unbounded, Bound::Excluded(y)))
+                        .chain(self.data.range((Bound::Included(x), Bound::Unbounded)))
                         .collect()
                 }
             }
@@ -379,22 +379,31 @@ where
                 let mut ranges = Vec::with_capacity(self.split_factor);
                 let chunk_len = div_ceil(local_values.len(), self.split_factor);
 
+                // Select the first index, for which the key is larger than the x of the range.
+                let mut start_index = local_values
+                    .iter()
+                    .position(|(k, _)| range.x() <= k)
+                    .unwrap_or(0);
+                let max_len = local_values.len();
                 for i in 0..self.split_factor {
+                    let s_index = start_index;
+                    let start = (s_index * chunk_len) % max_len;
+                    let e_index = s_index + 1;
+                    let end = (e_index * chunk_len) % max_len;
+
                     let (x, y) = if i == 0 {
                         // first
-                        (range.x(), local_values[(i + 1) * chunk_len].0)
+                        (range.x(), local_values[end].0)
                     } else if i == self.split_factor - 1 {
                         // last
-                        (local_values[i * chunk_len].0, range.y())
+                        (local_values[start].0, range.y())
                     } else {
                         // regular
-                        (
-                            local_values[i * chunk_len].0,
-                            local_values[(i + 1) * chunk_len].0,
-                        )
+                        (local_values[start].0, local_values[end].0)
                     };
                     let range = Range::new(x.clone(), y.clone());
                     ranges.push(range);
+                    start_index += 1;
                 }
 
                 for range in ranges.into_iter() {
@@ -492,8 +501,6 @@ mod tests {
         assert_eq!(res.bob_to_alice[1].parts.len(), 2);
         assert!(res.bob_to_alice[1].parts[0].is_range_item());
         assert!(res.bob_to_alice[1].parts[1].is_range_item());
-
-        res.print_messages();
     }
 
     #[test]
@@ -521,8 +528,6 @@ mod tests {
         let res = sync(None, &alice_set, &bob_set);
         assert_eq!(res.alice_to_bob.len(), 3, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
-
-        res.print_messages();
     }
 
     #[test]
@@ -542,8 +547,6 @@ mod tests {
         let res = sync(None, &alice_set, &bob_set);
         assert_eq!(res.alice_to_bob.len(), 3, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
-
-        res.print_messages();
     }
 
     #[test]
@@ -555,20 +558,34 @@ mod tests {
         let res = sync(None, &alice_set, &bob_set);
         assert_eq!(res.alice_to_bob.len(), 3, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
-        res.print_messages();
 
         // With Limit: just ape
         let limit = Range::Regular("ape", "bee");
         let res = sync(Some(limit), &alice_set, &bob_set);
         assert_eq!(res.alice_to_bob.len(), 1, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 0, "B -> A message count");
-        res.print_messages();
 
         // With Limit: just bee, cat
         let limit = Range::Regular("bee", "doe");
         let res = sync(Some(limit), &alice_set, &bob_set);
-        res.print_messages();
         assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
+        assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
+    }
+
+    #[test]
+    fn test_prefixes() {
+        let alice_set = [("/foo/bar", 1), ("/foo/baz", 1), ("/foo/cat", 1)];
+        let bob_set = [("/foo/bar", 1), ("/alice/bar", 1), ("/alice/baz", 1)];
+
+        // No Limit
+        let res = sync(None, &alice_set, &bob_set);
+        assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
+        assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
+
+        // With Limit: just /alice
+        let limit = Range::Regular("/alice", "/b");
+        let res = sync(Some(limit), &alice_set, &bob_set);
+        assert_eq!(res.alice_to_bob.len(), 1, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
     }
 
@@ -645,7 +662,6 @@ mod tests {
         let res = sync(None, &alice_set, &bob_set);
         assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
-        res.print_messages();
 
         // Needs more thought
 
@@ -654,7 +670,6 @@ mod tests {
         // let res = sync(Some(limit), &alice_set, &bob_set);
         // assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
         // assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
-        // res.print_messages();
 
         // // All authors, but only cat
         // let limit = Range::Regular(
@@ -664,7 +679,6 @@ mod tests {
         // let res = sync(Some(limit), &alice_set, &bob_set);
         // assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
         // assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
-        // res.print_messages();
     }
 
     struct SyncResult<K, V> {
@@ -794,19 +808,27 @@ mod tests {
                 next_to_bob = alice.process_message(msg);
             }
         }
-        let alice_now: Vec<_> = alice.all().collect();
+        let res = SyncResult {
+            alice,
+            bob,
+            alice_to_bob,
+            bob_to_alice,
+        };
+        res.print_messages();
+
+        let alice_now: Vec<_> = res.alice.all().collect();
         assert_eq!(
             expected_set_alice.iter().collect::<Vec<_>>(),
             alice_now,
             "alice"
         );
 
-        let bob_now: Vec<_> = bob.all().collect();
+        let bob_now: Vec<_> = res.bob.all().collect();
         assert_eq!(expected_set_bob.iter().collect::<Vec<_>>(), bob_now, "bob");
 
         // Check that values were never sent twice
         let mut alice_sent = BTreeMap::new();
-        for msg in &alice_to_bob {
+        for msg in &res.alice_to_bob {
             for part in &msg.parts {
                 if let Some(values) = part.values() {
                     for (key, value) in values {
@@ -822,7 +844,7 @@ mod tests {
         }
 
         let mut bob_sent = BTreeMap::new();
-        for msg in &bob_to_alice {
+        for msg in &res.bob_to_alice {
             for part in &msg.parts {
                 if let Some(values) = part.values() {
                     for (key, value) in values {
@@ -837,12 +859,7 @@ mod tests {
             }
         }
 
-        SyncResult {
-            alice,
-            bob,
-            alice_to_bob,
-            bob_to_alice,
-        }
+        res
     }
 
     #[test]
@@ -907,10 +924,10 @@ mod tests {
             .collect();
 
         assert_eq!(excluded.len(), 4);
-        assert_eq!(excluded[0].0, "fox");
-        assert_eq!(excluded[1].0, "hog");
-        assert_eq!(excluded[2].0, "bee");
-        assert_eq!(excluded[3].0, "cat");
+        assert_eq!(excluded[0].0, "bee");
+        assert_eq!(excluded[1].0, "cat");
+        assert_eq!(excluded[2].0, "fox");
+        assert_eq!(excluded[3].0, "hog");
 
         // Limit
         let all: Vec<_> = store
