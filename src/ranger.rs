@@ -7,34 +7,36 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::ops::Bound;
 
+/// Stores a range.
+///
+/// There are three possibilities
+/// - x, x: All elements in a set, denoted with
+/// - [x, y): x < y: Includes x, but not y
+/// - S \ [y, x) y < x: Includes x, but not y.
+/// This means that ranges are "wrap around" conceptually.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Range<K> {
-    /// All elements in a set, denoted with x, y: x = y
-    All(K),
-    /// [x, y): x < y
-    /// Includes x, but not y
-    Regular(K, K),
-    /// S \ [y, x) y < x
-    /// This means that ranges are "wrap around" conceptually.
-    /// Includes x, but not y
-    Exclusion(K, K),
+pub struct Range<K> {
+    x: K,
+    y: K,
 }
 
 impl<K> Range<K> {
-    fn x(&self) -> &K {
-        match self {
-            Range::All(k) => k,
-            Range::Regular(k, _) => k,
-            Range::Exclusion(k, _) => k,
-        }
+    pub fn x(&self) -> &K {
+        &self.x
     }
 
-    fn y(&self) -> &K {
-        match self {
-            Range::All(k) => k,
-            Range::Regular(_, k) => k,
-            Range::Exclusion(_, k) => k,
-        }
+    pub fn y(&self) -> &K {
+        &self.y
+    }
+
+    pub fn new(x: K, y: K) -> Self {
+        Range { x, y }
+    }
+}
+
+impl<K> From<(K, K)> for Range<K> {
+    fn from((x, y): (K, K)) -> Self {
+        Range { x, y }
     }
 }
 
@@ -42,21 +44,29 @@ impl<K> Range<K>
 where
     K: Ord,
 {
-    fn new(x: K, y: K) -> Self {
-        match x.cmp(&y) {
-            Ordering::Less => Range::Regular(x, y),
-            Ordering::Greater => Range::Exclusion(x, y),
-            Ordering::Equal => Range::All(x),
+    /// Is this key inside the range?
+    pub fn contains(&self, k: &K) -> bool {
+        match self.range_type() {
+            Ordering::Equal => true,
+            Ordering::Less => &self.x <= k && k < &self.y,
+            Ordering::Greater => &self.x > k && k <= &self.y,
         }
     }
 
-    /// Is this key inside the range?
-    pub fn contains(&self, k: &K) -> bool {
-        match self {
-            Range::All(_) => true,
-            Range::Regular(x, y) => x <= k && k < y,
-            Range::Exclusion(x, y) => x > k && k <= y,
-        }
+    pub fn range_type(&self) -> Ordering {
+        self.x.cmp(&self.y)
+    }
+
+    pub fn is_all(&self) -> bool {
+        matches!(self.range_type(), Ordering::Equal)
+    }
+
+    pub fn is_regular(&self) -> bool {
+        matches!(self.range_type(), Ordering::Less)
+    }
+
+    pub fn is_wrap_around(&self) -> bool {
+        matches!(self.range_type(), Ordering::Greater)
     }
 }
 
@@ -151,7 +161,7 @@ where
     /// Construct the initial message.
     fn init(store: &Store<K, V>, limit: Option<&Range<K>>) -> Self {
         let x = store.get_first().clone();
-        let range = Range::All(x);
+        let range = Range::new(x.clone(), x);
         let fingerprint = store.get_fingerprint(&range, limit);
         let part = MessagePart::RangeFingerprint(RangeFingerprint { range, fingerprint });
         Message { parts: vec![part] }
@@ -209,42 +219,42 @@ where
 
     /// Returns all items in the given range
     fn get_range(&self, range: &Range<K>, limit: Option<&Range<K>>) -> Vec<(&K, &V)> {
-        match range {
-            Range::All(_) => {
+        match range.range_type() {
+            Ordering::Equal => {
+                let bound = (Bound::<K>::Unbounded, Bound::<K>::Unbounded);
                 if let Some(limit) = limit {
                     self.data
-                        .range((Bound::<K>::Unbounded, Bound::<K>::Unbounded))
+                        .range(bound)
                         .filter(|(k, _)| limit.contains(k))
                         .collect()
                 } else {
-                    self.data
-                        .range((Bound::<K>::Unbounded, Bound::<K>::Unbounded))
-                        .collect()
+                    self.data.range(bound).collect()
                 }
             }
-            Range::Regular(x, y) => {
+            Ordering::Less => {
+                let bound = (Bound::Included(&range.x), Bound::Excluded(&range.y));
                 if let Some(limit) = limit {
                     self.data
-                        .range((Bound::Included(x), Bound::Excluded(y)))
+                        .range(bound)
                         .filter(|(k, _)| limit.contains(k))
                         .collect()
                 } else {
-                    self.data
-                        .range((Bound::Included(x), Bound::Excluded(y)))
-                        .collect()
+                    self.data.range(bound).collect()
                 }
             }
-            Range::Exclusion(x, y) => {
+            Ordering::Greater => {
+                let bound_a = (Bound::Unbounded, Bound::Excluded(&range.y));
+                let bound_b = (Bound::Included(&range.x), Bound::Unbounded);
                 if let Some(limit) = limit {
                     self.data
-                        .range((Bound::Unbounded, Bound::Excluded(y)))
-                        .chain(self.data.range((Bound::Included(x), Bound::Unbounded)))
+                        .range(bound_a)
+                        .chain(self.data.range(bound_b))
                         .filter(|(k, _)| limit.contains(k))
                         .collect()
                 } else {
                     self.data
-                        .range((Bound::Unbounded, Bound::Excluded(y)))
-                        .chain(self.data.range((Bound::Included(x), Bound::Unbounded)))
+                        .range(bound_a)
+                        .chain(self.data.range(bound_b))
                         .collect()
                 }
             }
@@ -560,13 +570,13 @@ mod tests {
         assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
 
         // With Limit: just ape
-        let limit = Range::Regular("ape", "bee");
+        let limit = ("ape", "bee").into();
         let res = sync(Some(limit), &alice_set, &bob_set);
         assert_eq!(res.alice_to_bob.len(), 1, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 0, "B -> A message count");
 
         // With Limit: just bee, cat
-        let limit = Range::Regular("bee", "doe");
+        let limit = ("bee", "doe").into();
         let res = sync(Some(limit), &alice_set, &bob_set);
         assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
@@ -583,7 +593,7 @@ mod tests {
         assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
 
         // With Limit: just /alice
-        let limit = Range::Regular("/alice", "/b");
+        let limit = ("/alice", "/b").into();
         let res = sync(Some(limit), &alice_set, &bob_set);
         assert_eq!(res.alice_to_bob.len(), 1, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
@@ -600,7 +610,7 @@ mod tests {
         assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
 
         // With Limit: just /alice
-        let limit = Range::Regular("/alice", "/b");
+        let limit = ("/alice", "/b").into();
         let res = sync(Some(limit), &alice_set, &bob_set);
         assert_eq!(res.alice_to_bob.len(), 1, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
@@ -617,7 +627,7 @@ mod tests {
         assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
 
         // With Limit: just /alice
-        let limit = Range::Regular("/alice", "/b");
+        let limit = ("/alice", "/b").into();
         let res = sync(Some(limit), &alice_set, &bob_set);
         assert_eq!(res.alice_to_bob.len(), 1, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 0, "B -> A message count");
@@ -913,14 +923,14 @@ mod tests {
         }
 
         let all: Vec<_> = store
-            .get_range(&Range::All(""), None)
+            .get_range(&Range::new("", ""), None)
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
         assert_eq!(&all, &set[..]);
 
         let regular: Vec<_> = store
-            .get_range(&Range::Regular("bee", "eel"), None)
+            .get_range(&("bee", "eel").into(), None)
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
@@ -928,21 +938,21 @@ mod tests {
 
         // empty start
         let regular: Vec<_> = store
-            .get_range(&Range::Regular("", "eel"), None)
+            .get_range(&("", "eel").into(), None)
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
         assert_eq!(&regular, &set[..3]);
 
         let regular: Vec<_> = store
-            .get_range(&Range::Regular("cat", "hog"), None)
+            .get_range(&("cat", "hog").into(), None)
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
         assert_eq!(&regular, &set[1..5]);
 
         let excluded: Vec<_> = store
-            .get_range(&Range::Exclusion("fox", "bee"), None)
+            .get_range(&("fox", "bee").into(), None)
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
@@ -952,7 +962,7 @@ mod tests {
         assert_eq!(excluded[1].0, "hog");
 
         let excluded: Vec<_> = store
-            .get_range(&Range::Exclusion("fox", "doe"), None)
+            .get_range(&("fox", "doe").into(), None)
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
@@ -965,7 +975,7 @@ mod tests {
 
         // Limit
         let all: Vec<_> = store
-            .get_range(&Range::All(""), Some(&Range::Regular("bee", "doe")))
+            .get_range(&("", "").into(), Some(&("bee", "doe").into()))
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
