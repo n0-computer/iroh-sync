@@ -573,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prefixes() {
+    fn test_prefixes_simple() {
         let alice_set = [("/foo/bar", 1), ("/foo/baz", 1), ("/foo/cat", 1)];
         let bob_set = [("/foo/bar", 1), ("/alice/bar", 1), ("/alice/baz", 1)];
 
@@ -587,6 +587,40 @@ mod tests {
         let res = sync(Some(limit), &alice_set, &bob_set);
         assert_eq!(res.alice_to_bob.len(), 1, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
+    }
+
+    #[test]
+    fn test_prefixes_empty_alice() {
+        let alice_set = [];
+        let bob_set = [("/foo/bar", 1), ("/alice/bar", 1), ("/alice/baz", 1)];
+
+        // No Limit
+        let res = sync(None, &alice_set, &bob_set);
+        assert_eq!(res.alice_to_bob.len(), 1, "A -> B message count");
+        assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
+
+        // With Limit: just /alice
+        let limit = Range::Regular("/alice", "/b");
+        let res = sync(Some(limit), &alice_set, &bob_set);
+        assert_eq!(res.alice_to_bob.len(), 1, "A -> B message count");
+        assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
+    }
+
+    #[test]
+    fn test_prefixes_empty_bob() {
+        let alice_set = [("/foo/bar", 1), ("/foo/baz", 1), ("/foo/cat", 1)];
+        let bob_set = [];
+
+        // No Limit
+        let res = sync(None, &alice_set, &bob_set);
+        assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
+        assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
+
+        // With Limit: just /alice
+        let limit = Range::Regular("/alice", "/b");
+        let res = sync(Some(limit), &alice_set, &bob_set);
+        assert_eq!(res.alice_to_bob.len(), 1, "A -> B message count");
+        assert_eq!(res.bob_to_alice.len(), 0, "B -> A message count");
     }
 
     #[test]
