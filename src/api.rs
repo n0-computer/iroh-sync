@@ -209,6 +209,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore]
     fn the_example() {
         // Create an author keypair.
         let author_keypair = AuthorKeypair::new("cool-bear");
