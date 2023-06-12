@@ -693,7 +693,7 @@ mod tests {
             (Multikey::new(author_a, "ape"), 1),
             (Multikey::new(author_a, "bee"), 1),
             (Multikey::new(author_b, "bee"), 1),
-            (Multikey::new(author_a, "cat"), 1),
+            (Multikey::new(author_a, "doe"), 1),
         ];
         let bob_set = [
             (Multikey::new(author_a, "ape"), 1),
@@ -709,20 +709,20 @@ mod tests {
 
         // Needs more thought
 
-        // // Only author_a
-        // let limit = Range::Regular(Multikey::new(author_a, ""), Multikey::new(author_b, ""));
-        // let res = sync(Some(limit), &alice_set, &bob_set);
-        // assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
-        // assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
+        // Only author_a
+        let limit = Range::new(Multikey::new(author_a, ""), Multikey::new(author_b, ""));
+        let res = sync(Some(limit), &alice_set, &bob_set);
+        assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
+        assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
 
-        // // All authors, but only cat
-        // let limit = Range::Regular(
-        //     Multikey::new(author_a, "cat"),
-        //     Multikey::new(author_b, "ape"),
-        // );
-        // let res = sync(Some(limit), &alice_set, &bob_set);
-        // assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
-        // assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
+        // All authors, but only cat
+        let limit = Range::new(
+            Multikey::new(author_a, "cat"),
+            Multikey::new(author_b, "doe"),
+        );
+        let res = sync(Some(limit), &alice_set, &bob_set);
+        assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
+        assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
     }
 
     struct SyncResult<K, V> {
