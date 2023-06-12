@@ -236,6 +236,10 @@ where
         })
     }
 
+    fn remove(&mut self, key: &K) -> Option<V> {
+        self.data.remove(key)
+    }
+
     fn all(&self) -> impl Iterator<Item = (&K, &V)> {
         self.data.iter()
     }
@@ -431,6 +435,11 @@ where
     /// Insert a key value pair.
     pub fn put(&mut self, k: K, v: V) {
         self.store.put(k, v);
+    }
+
+    /// Remove the given key.
+    pub fn remove(&mut self, k: &K) -> Option<V> {
+        self.store.remove(k)
     }
 
     /// List all existing key value pairs.

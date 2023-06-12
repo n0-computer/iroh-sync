@@ -141,6 +141,22 @@ impl Replica {
     pub fn peer_mut(&mut self) -> &mut Peer<RecordIdentifier, SignedEntry> {
         &mut self.peer
     }
+
+    /// Removes any content that was synced, that does not contain
+    /// valid signatures.
+    pub fn verify_store(&mut self) {
+        // TODO: this should probably happen during the sync.
+        let mut to_remove = Vec::new();
+        for (k, v) in self.peer.all() {
+            if v.verify().is_err() {
+                to_remove.push(k.clone());
+            }
+        }
+
+        for k in to_remove {
+            self.peer.remove(&k);
+        }
+    }
 }
 
 /// A signed entry.
@@ -454,6 +470,10 @@ mod tests {
                 next_to_bob = alice.peer_mut().process_message(msg);
             }
         }
+
+        // check signatures
+        alice.verify_store();
+        bob.verify_store();
 
         // Check result
         for el in alice_set {
