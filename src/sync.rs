@@ -223,14 +223,20 @@ impl Record {
         }
     }
 
-    pub fn from_data(data: impl AsRef<[u8]>) -> Self {
+    pub fn from_data(data: impl AsRef<[u8]>, namespace: &NamespaceId) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("time drift")
             .as_micros() as u64;
         let data = data.as_ref();
         let len = data.len() as u64;
-        let hash = blake3::hash(data);
+        // Salted hash
+        // TODO: do we actually want this?
+        // TODO: this should probably use a namespace prefix if used
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(namespace.as_bytes());
+        hasher.update(data);
+        let hash = hasher.finalize();
 
         Self::new(timestamp, len, hash)
     }
@@ -253,7 +259,7 @@ mod tests {
         let myspace = Namespace::new(&mut rng);
 
         let record_id = RecordIdentifier::new("/my/key", myspace.id(), alice.id());
-        let record = Record::from_data(b"this is my cool data");
+        let record = Record::from_data(b"this is my cool data", myspace.id());
         let entry = Entry::new(record_id, record);
         let signed_entry = entry.sign(&myspace, &alice);
         signed_entry.verify().expect("failed to verify");
