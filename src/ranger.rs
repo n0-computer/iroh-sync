@@ -707,8 +707,6 @@ mod tests {
         assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
 
-        // Needs more thought
-
         // Only author_a
         let limit = Range::new(Multikey::new(author_a, ""), Multikey::new(author_b, ""));
         let res = sync(Some(limit), &alice_set, &bob_set);
