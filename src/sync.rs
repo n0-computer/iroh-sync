@@ -4,11 +4,13 @@
 //
 // This is going to change!
 
-use std::time::SystemTime;
+use std::{cmp::Ordering, collections::HashMap, time::SystemTime};
 
 use blake3::Hash;
 use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, VerifyingKey};
 use rand_core::CryptoRngCore;
+
+use crate::ranger::{AsFingerprint, Fingerprint, Peer, RangeKey};
 
 #[derive(Debug)]
 pub struct Author {
@@ -37,7 +39,7 @@ impl Author {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthorId(VerifyingKey);
 
 impl AuthorId {
@@ -50,7 +52,7 @@ impl AuthorId {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Namespace {
     priv_key: SigningKey,
     id: NamespaceId,
@@ -77,7 +79,7 @@ impl Namespace {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
 pub struct NamespaceId(VerifyingKey);
 
 impl NamespaceId {
@@ -93,24 +95,32 @@ impl NamespaceId {
 #[derive(Debug)]
 pub struct Replica {
     namespace: Namespace,
-    entries: Vec<SignedEntry>,
+    peer: Peer<RecordIdentifier, SignedEntry>,
+    content: HashMap<Hash, Vec<u8>>,
 }
 
 impl Replica {
     pub fn new(namespace: Namespace) -> Self {
         Replica {
             namespace,
-            entries: Vec::new(),
+            peer: Peer::default(),
+            content: HashMap::default(),
         }
     }
 
     /// Inserts a new record at the given key.
     pub fn insert(&mut self, key: impl AsRef<[u8]>, author: &Author, data: impl AsRef<[u8]>) {
         let id = RecordIdentifier::new(key, self.namespace.id(), author.id());
-        let record = Record::from_data(data, self.namespace.id());
-        let entry = Entry::new(id, record);
+        let record = Record::from_data(data.as_ref(), self.namespace.id());
+
+        // Store content
+        self.content
+            .insert(*record.content_hash(), data.as_ref().to_vec());
+
+        // Store signed entries
+        let entry = Entry::new(id.clone(), record);
         let signed_entry = entry.sign(&self.namespace, author);
-        self.entries.push(signed_entry);
+        self.peer.put(id, signed_entry);
     }
 
     /// Gets all entries matching this key and author.
@@ -119,14 +129,22 @@ impl Replica {
         key: impl AsRef<[u8]> + 'c,
         author: &'b AuthorId,
     ) -> impl Iterator<Item = &SignedEntry> + 'a {
-        self.entries
-            .iter()
-            .filter(move |e| e.entry.id.key == key.as_ref() && &e.entry.id.author == author)
+        self.peer.all().filter_map(move |(_, e)| {
+            if e.entry.id.key == key.as_ref() && &e.entry.id.author == author {
+                Some(e)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn peer_mut(&mut self) -> &mut Peer<RecordIdentifier, SignedEntry> {
+        &mut self.peer
     }
 }
 
 /// A signed entry.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SignedEntry {
     signature: EntrySignature,
     entry: Entry,
@@ -153,7 +171,7 @@ impl SignedEntry {
 }
 
 /// Signature over an entry.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EntrySignature {
     author_signature: Signature,
     namespace_signature: Signature,
@@ -188,7 +206,7 @@ impl EntrySignature {
 }
 
 /// A single entry in a replica.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Entry {
     id: RecordIdentifier,
     record: Record,
@@ -225,7 +243,7 @@ impl Entry {
 }
 
 /// The indentifier of a record.
-#[derive(Debug)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RecordIdentifier {
     /// The key of the record.
     key: Vec<u8>,
@@ -233,6 +251,55 @@ pub struct RecordIdentifier {
     namespace: NamespaceId,
     /// The author that wrote this record.
     author: AuthorId,
+}
+
+impl AsFingerprint for RecordIdentifier {
+    fn as_fingerprint(&self) -> crate::ranger::Fingerprint {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.namespace.as_bytes());
+        hasher.update(self.author.as_bytes());
+        hasher.update(&self.key);
+        Fingerprint(hasher.finalize().into())
+    }
+}
+
+impl PartialOrd for NamespaceId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NamespaceId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.as_bytes().cmp(other.0.as_bytes())
+    }
+}
+
+impl PartialOrd for AuthorId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AuthorId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.as_bytes().cmp(other.0.as_bytes())
+    }
+}
+
+impl RangeKey for RecordIdentifier {
+    fn contains(&self, range: &crate::ranger::Range<Self>) -> bool {
+        // For now we just do key inclusion and check if namespace and author match
+        if self.namespace != range.x().namespace || self.namespace != range.y().namespace {
+            return false;
+        }
+        if self.author != range.x().author || self.author != range.y().author {
+            return false;
+        }
+
+        let mapped_range = range.clone().map(|x, y| (x.key, y.key));
+        crate::ranger::contains(&self.key, &mapped_range)
+    }
 }
 
 impl RecordIdentifier {
@@ -263,7 +330,7 @@ impl RecordIdentifier {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Record {
     /// Record creation timestamp. Counted as micros since the Unix epoch.
     timestamp: u64,
@@ -346,6 +413,77 @@ mod tests {
             assert_eq!(res[0].entry().record().content_len(), len);
 
             res[0].verify().expect("invalid signature");
+        }
+    }
+
+    #[test]
+    fn test_replica_sync() {
+        let alice_set = ["ape", "eel", "fox", "gnu"];
+        let bob_set = ["bee", "cat", "doe", "eel", "fox", "hog"];
+
+        let mut rng = rand::thread_rng();
+        let author = Author::new(&mut rng);
+        let myspace = Namespace::new(&mut rng);
+        let mut alice = Replica::new(myspace.clone());
+        for el in &alice_set {
+            alice.insert(el, &author, el);
+        }
+
+        let mut bob = Replica::new(myspace);
+        for el in &bob_set {
+            bob.insert(el, &author, el);
+        }
+
+        sync(&author, &mut alice, &mut bob, &alice_set, &bob_set);
+    }
+
+    fn sync(
+        author: &Author,
+        alice: &mut Replica,
+        bob: &mut Replica,
+        alice_set: &[&str],
+        bob_set: &[&str],
+    ) {
+        // Sync alice - bob
+        let mut next_to_bob = Some(alice.peer_mut().initial_message());
+        let mut rounds = 0;
+        while let Some(msg) = next_to_bob.take() {
+            assert!(rounds < 100, "too many rounds");
+            rounds += 1;
+            if let Some(msg) = bob.peer_mut().process_message(msg) {
+                next_to_bob = alice.peer_mut().process_message(msg);
+            }
+        }
+
+        // Check result
+        for el in alice_set {
+            assert_eq!(
+                alice.get(el, author.id()).collect::<Vec<_>>().len(),
+                1,
+                "{}",
+                el
+            );
+            assert_eq!(
+                bob.get(el, author.id()).collect::<Vec<_>>().len(),
+                1,
+                "{}",
+                el
+            );
+        }
+
+        for el in bob_set {
+            assert_eq!(
+                alice.get(el, author.id()).collect::<Vec<_>>().len(),
+                1,
+                "{}",
+                el
+            );
+            assert_eq!(
+                bob.get(el, author.id()).collect::<Vec<_>>().len(),
+                1,
+                "{}",
+                el
+            );
         }
     }
 }

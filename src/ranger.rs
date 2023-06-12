@@ -31,6 +31,11 @@ impl<K> Range<K> {
     pub fn new(x: K, y: K) -> Self {
         Range { x, y }
     }
+
+    pub fn map<X>(self, f: impl FnOnce(K, K) -> (X, X)) -> Range<X> {
+        let (x, y) = f(self.x, self.y);
+        Range { x, y }
+    }
 }
 
 impl<K> From<(K, K)> for Range<K> {
@@ -42,11 +47,16 @@ impl<K> From<(K, K)> for Range<K> {
 pub trait RangeKey: Sized + Ord + Debug {
     /// Is this key inside the range?
     fn contains(&self, range: &Range<Self>) -> bool {
-        match range.x().cmp(range.y()) {
-            Ordering::Equal => true,
-            Ordering::Less => range.x() <= self && self < range.y(),
-            Ordering::Greater => range.x() <= self || self < range.y(),
-        }
+        contains(self, range)
+    }
+}
+
+/// Default implementation of `contains` for `Ord` types.
+pub fn contains<T: Ord>(t: &T, range: &Range<T>) -> bool {
+    match range.x().cmp(range.y()) {
+        Ordering::Equal => true,
+        Ordering::Less => range.x() <= t && t < range.y(),
+        Ordering::Greater => range.x() <= t || t < range.y(),
     }
 }
 
@@ -54,7 +64,7 @@ impl RangeKey for &str {}
 impl RangeKey for &[u8] {}
 
 #[derive(Copy, Clone, PartialEq)]
-pub struct Fingerprint([u8; 32]);
+pub struct Fingerprint(pub [u8; 32]);
 
 impl Debug for Fingerprint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -156,7 +166,7 @@ where
 }
 
 #[derive(Debug)]
-struct Store<K, V> {
+pub struct Store<K, V> {
     data: BTreeMap<K, V>,
 }
 
