@@ -5,7 +5,6 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::ops::Bound;
 
 /// Stores a range.
 ///
@@ -40,35 +39,19 @@ impl<K> From<(K, K)> for Range<K> {
     }
 }
 
-impl<K> Range<K>
-where
-    K: Ord,
-{
+pub trait RangeKey: Sized + Ord + Debug {
     /// Is this key inside the range?
-    pub fn contains(&self, k: &K) -> bool {
-        match self.range_type() {
+    fn contains(&self, range: &Range<Self>) -> bool {
+        match range.x().cmp(range.y()) {
             Ordering::Equal => true,
-            Ordering::Less => &self.x <= k && k < &self.y,
-            Ordering::Greater => &self.x > k && k <= &self.y,
+            Ordering::Less => range.x() <= self && self < range.y(),
+            Ordering::Greater => range.x() <= self || self < range.y(),
         }
     }
-
-    pub fn range_type(&self) -> Ordering {
-        self.x.cmp(&self.y)
-    }
-
-    pub fn is_all(&self) -> bool {
-        matches!(self.range_type(), Ordering::Equal)
-    }
-
-    pub fn is_regular(&self) -> bool {
-        matches!(self.range_type(), Ordering::Less)
-    }
-
-    pub fn is_wrap_around(&self) -> bool {
-        matches!(self.range_type(), Ordering::Greater)
-    }
 }
+
+impl RangeKey for &str {}
+impl RangeKey for &[u8] {}
 
 #[derive(Copy, Clone, PartialEq)]
 pub struct Fingerprint([u8; 32]);
@@ -156,7 +139,7 @@ pub struct Message<K, V> {
 
 impl<K, V> Message<K, V>
 where
-    K: Ord + Clone + Default + AsFingerprint,
+    K: RangeKey + Clone + Default + AsFingerprint,
 {
     /// Construct the initial message.
     fn init(store: &Store<K, V>, limit: Option<&Range<K>>) -> Self {
@@ -187,7 +170,7 @@ impl<K, V> Default for Store<K, V> {
 
 impl<K, V> Store<K, V>
 where
-    K: Ord + Clone + Default + AsFingerprint,
+    K: RangeKey + Clone + Default + AsFingerprint,
 {
     /// Get a random element.
     fn get_first(&self) -> K {
@@ -198,14 +181,23 @@ where
         }
     }
 
+    fn get(&self, key: &K) -> Option<&V> {
+        self.data.get(key)
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     /// Calculate the fingerprint of the given range.
     fn get_fingerprint(&self, range: &Range<K>, limit: Option<&Range<K>>) -> Fingerprint {
         let elements = self.get_range(range, limit);
-        if elements.is_empty() {
-            return Fingerprint::empty();
-        }
-        let mut fp = elements[0].0.as_fingerprint();
-        for el in &elements[1..] {
+        let mut fp = Fingerprint::empty();
+        for el in elements {
             fp ^= el.0.as_fingerprint();
         }
 
@@ -218,47 +210,20 @@ where
     }
 
     /// Returns all items in the given range
-    fn get_range(&self, range: &Range<K>, limit: Option<&Range<K>>) -> Vec<(&K, &V)> {
-        match range.range_type() {
-            Ordering::Equal => {
-                let bound = (Bound::<K>::Unbounded, Bound::<K>::Unbounded);
-                if let Some(limit) = limit {
-                    self.data
-                        .range(bound)
-                        .filter(|(k, _)| limit.contains(k))
-                        .collect()
-                } else {
-                    self.data.range(bound).collect()
-                }
+    fn get_range<'a, 'b: 'a, 'c: 'a>(
+        &'a self,
+        range: &'b Range<K>,
+        limit: Option<&'c Range<K>>,
+    ) -> impl Iterator<Item = (&K, &V)> + 'a {
+        // TODO: this is not very efficient, optimize depending on data structure
+        self.data.iter().filter(move |(k, _)| {
+            let r = k.contains(range);
+            if let Some(limit) = limit {
+                r && k.contains(limit)
+            } else {
+                r
             }
-            Ordering::Less => {
-                let bound = (Bound::Included(&range.x), Bound::Excluded(&range.y));
-                if let Some(limit) = limit {
-                    self.data
-                        .range(bound)
-                        .filter(|(k, _)| limit.contains(k))
-                        .collect()
-                } else {
-                    self.data.range(bound).collect()
-                }
-            }
-            Ordering::Greater => {
-                let bound_a = (Bound::Unbounded, Bound::Excluded(&range.y));
-                let bound_b = (Bound::Included(&range.x), Bound::Unbounded);
-                if let Some(limit) = limit {
-                    self.data
-                        .range(bound_a)
-                        .chain(self.data.range(bound_b))
-                        .filter(|(k, _)| limit.contains(k))
-                        .collect()
-                } else {
-                    self.data
-                        .range(bound_a)
-                        .chain(self.data.range(bound_b))
-                        .collect()
-                }
-            }
-        }
+        })
     }
 
     fn all(&self) -> impl Iterator<Item = (&K, &V)> {
@@ -289,7 +254,7 @@ impl<K, V> Default for Peer<K, V> {
 
 impl<K, V> Peer<K, V>
 where
-    K: PartialEq + Ord + Clone + Default + Debug + AsFingerprint,
+    K: PartialEq + RangeKey + Clone + Default + Debug + AsFingerprint,
     V: Clone + Debug,
 {
     pub fn with_limit(limit: Range<K>) -> Self {
@@ -371,14 +336,15 @@ where
             }
 
             // Case2 Recursion Anchor
-            let local_values = self.store.get_range(&range, self.limit.as_ref());
+            let local_values: Vec<_> = self.store.get_range(&range, self.limit.as_ref()).collect();
             if local_values.len() <= 1 || fingerprint == Fingerprint::empty() {
+                let values = local_values
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
                 out.push(MessagePart::RangeItem(RangeItem {
                     range,
-                    values: local_values
-                        .into_iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
+                    values,
                     have_local: false,
                 }));
             } else {
@@ -417,7 +383,7 @@ where
                 }
 
                 for range in ranges.into_iter() {
-                    let chunk = self.store.get_range(&range, self.limit.as_ref());
+                    let chunk: Vec<_> = self.store.get_range(&range, self.limit.as_ref()).collect();
                     // Add either the fingerprint or the item set
                     let fingerprint = self.store.get_fingerprint(&range, self.limit.as_ref());
                     if chunk.len() > self.max_set_size {
@@ -426,16 +392,17 @@ where
                             fingerprint,
                         }));
                     } else {
+                        let values = chunk
+                            .into_iter()
+                            .map(|(k, v)| {
+                                let k: K = k.clone();
+                                let v: V = v.clone();
+                                (k, v)
+                            })
+                            .collect();
                         out.push(MessagePart::RangeItem(RangeItem {
                             range,
-                            values: chunk
-                                .into_iter()
-                                .map(|(k, v)| {
-                                    let k: K = k.clone();
-                                    let v: V = v.clone();
-                                    (k, v)
-                                })
-                                .collect(),
+                            values,
                             have_local: false,
                         }));
                     }
@@ -635,24 +602,60 @@ mod tests {
 
     #[test]
     fn test_multikey() {
-        #[derive(Default, Clone, PartialEq, Eq)]
+        #[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
         struct Multikey {
             author: [u8; 4],
             key: Vec<u8>,
         }
 
-        impl PartialOrd for Multikey {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for Multikey {
-            fn cmp(&self, other: &Self) -> Ordering {
-                let author = self.author.cmp(&other.author);
-                if author == Ordering::Equal {
-                    self.key.cmp(&other.key)
-                } else {
-                    author
+        impl RangeKey for Multikey {
+            fn contains(&self, range: &Range<Self>) -> bool {
+                let author = range.x().author.cmp(&range.y().author);
+                let key = range.x().key.cmp(&range.y().key);
+
+                match (author, key) {
+                    (Ordering::Equal, Ordering::Equal) => {
+                        // All
+                        true
+                    }
+                    (Ordering::Equal, Ordering::Less) => {
+                        // Regular, based on key
+                        range.x().key <= self.key && self.key < range.y().key
+                    }
+                    (Ordering::Equal, Ordering::Greater) => {
+                        // Reverse, based on key
+                        range.x().key <= self.key || self.key < range.y().key
+                    }
+                    (Ordering::Less, Ordering::Equal) => {
+                        // Regular, based on author
+                        range.x().author <= self.author && self.author < range.y().author
+                    }
+                    (Ordering::Greater, Ordering::Equal) => {
+                        // Reverse, based on key
+                        range.x().author <= self.author || self.author < range.y().author
+                    }
+                    (Ordering::Less, Ordering::Less) => {
+                        // Regular, key and author
+                        range.x().key <= self.key
+                            && self.key < range.y().key
+                            && range.x().author <= self.author
+                            && self.author < range.y().author
+                    }
+                    (Ordering::Greater, Ordering::Greater) => {
+                        // Reverse, key and author
+                        (range.x().key <= self.key || self.key < range.y().key)
+                            && (range.x().author <= self.author || self.author < range.y().author)
+                    }
+                    (Ordering::Less, Ordering::Greater) => {
+                        // Regular author, Reverse key
+                        (range.x().key <= self.key || self.key < range.y().key)
+                            && (range.x().author <= self.author && self.author < range.y().author)
+                    }
+                    (Ordering::Greater, Ordering::Less) => {
+                        // Regular key, Reverse author
+                        (range.x().key <= self.key && self.key < range.y().key)
+                            && (range.x().author <= self.author || self.author < range.y().author)
+                    }
                 }
             }
         }
@@ -706,21 +709,87 @@ mod tests {
         let res = sync(None, &alice_set, &bob_set);
         assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 2, "B -> A message count");
+        res.assert_alice_set(
+            "no limit",
+            &[
+                (Multikey::new(author_a, "ape"), 1),
+                (Multikey::new(author_a, "bee"), 1),
+                (Multikey::new(author_b, "bee"), 1),
+                (Multikey::new(author_a, "doe"), 1),
+                (Multikey::new(author_a, "cat"), 1),
+                (Multikey::new(author_b, "cat"), 1),
+            ],
+        );
+
+        res.assert_bob_set(
+            "no limit",
+            &[
+                (Multikey::new(author_a, "ape"), 1),
+                (Multikey::new(author_a, "bee"), 1),
+                (Multikey::new(author_b, "bee"), 1),
+                (Multikey::new(author_a, "doe"), 1),
+                (Multikey::new(author_a, "cat"), 1),
+                (Multikey::new(author_b, "cat"), 1),
+            ],
+        );
 
         // Only author_a
         let limit = Range::new(Multikey::new(author_a, ""), Multikey::new(author_b, ""));
         let res = sync(Some(limit), &alice_set, &bob_set);
         assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
+        res.assert_alice_set(
+            "only author_a",
+            &[
+                (Multikey::new(author_a, "ape"), 1),
+                (Multikey::new(author_a, "bee"), 1),
+                (Multikey::new(author_b, "bee"), 1),
+                (Multikey::new(author_a, "doe"), 1),
+                (Multikey::new(author_a, "cat"), 1),
+            ],
+        );
+
+        res.assert_bob_set(
+            "only author_a",
+            &[
+                (Multikey::new(author_a, "ape"), 1),
+                (Multikey::new(author_a, "bee"), 1),
+                (Multikey::new(author_a, "cat"), 1),
+                (Multikey::new(author_b, "cat"), 1),
+                (Multikey::new(author_a, "doe"), 1),
+            ],
+        );
 
         // All authors, but only cat
         let limit = Range::new(
             Multikey::new(author_a, "cat"),
-            Multikey::new(author_b, "doe"),
+            Multikey::new(author_a, "doe"),
         );
         let res = sync(Some(limit), &alice_set, &bob_set);
-        assert_eq!(res.alice_to_bob.len(), 2, "A -> B message count");
+        assert_eq!(res.alice_to_bob.len(), 1, "A -> B message count");
         assert_eq!(res.bob_to_alice.len(), 1, "B -> A message count");
+
+        res.assert_alice_set(
+            "only cat",
+            &[
+                (Multikey::new(author_a, "ape"), 1),
+                (Multikey::new(author_a, "bee"), 1),
+                (Multikey::new(author_b, "bee"), 1),
+                (Multikey::new(author_a, "doe"), 1),
+                (Multikey::new(author_a, "cat"), 1),
+                (Multikey::new(author_b, "cat"), 1),
+            ],
+        );
+
+        res.assert_bob_set(
+            "only cat",
+            &[
+                (Multikey::new(author_a, "ape"), 1),
+                (Multikey::new(author_a, "bee"), 1),
+                (Multikey::new(author_a, "cat"), 1),
+                (Multikey::new(author_b, "cat"), 1),
+            ],
+        );
     }
 
     struct SyncResult<K, V> {
@@ -747,6 +816,41 @@ mod tests {
                     print_message(msg);
                 }
             }
+        }
+    }
+
+    impl<K, V> SyncResult<K, V>
+    where
+        K: Debug + RangeKey + Clone + Default + AsFingerprint,
+        V: Debug + Clone + PartialEq,
+    {
+        fn assert_alice_set(&self, ctx: &str, expected: &[(K, V)]) {
+            dbg!(self.alice.all().collect::<Vec<_>>());
+            for (k, v) in expected {
+                assert_eq!(
+                    self.alice.store.get(k),
+                    Some(v),
+                    "{}: (alice) missing key {:?}",
+                    ctx,
+                    k
+                );
+            }
+            assert_eq!(expected.len(), self.alice.store.len(), "{}: (alice)", ctx);
+        }
+
+        fn assert_bob_set(&self, ctx: &str, expected: &[(K, V)]) {
+            dbg!(self.bob.all().collect::<Vec<_>>());
+
+            for (k, v) in expected {
+                assert_eq!(
+                    self.bob.store.get(k),
+                    Some(v),
+                    "{}: (bob) missing key {:?}",
+                    ctx,
+                    k
+                );
+            }
+            assert_eq!(expected.len(), self.bob.store.len(), "{}: (bob)", ctx);
         }
     }
 
@@ -788,7 +892,7 @@ mod tests {
         bob_set: &[(K, V)],
     ) -> SyncResult<K, V>
     where
-        K: PartialEq + Ord + Clone + Default + Debug + AsFingerprint,
+        K: PartialEq + RangeKey + Clone + Default + Debug + AsFingerprint,
         V: Clone + Debug + PartialEq,
     {
         println!("Using Limit: {:?}", limit);
@@ -804,7 +908,7 @@ mod tests {
             alice.put(k.clone(), v.clone());
 
             let include = if let Some(ref limit) = limit {
-                limit.contains(k)
+                k.contains(limit)
             } else {
                 true
             };
@@ -823,7 +927,7 @@ mod tests {
         for (k, v) in bob_set {
             bob.put(k.clone(), v.clone());
             let include = if let Some(ref limit) = limit {
-                limit.contains(k)
+                k.contains(limit)
             } else {
                 true
             };
@@ -915,7 +1019,6 @@ mod tests {
             ("fox", 1),
             ("hog", 1),
         ];
-
         for (k, v) in &set {
             store.put(*k, *v);
         }
@@ -955,9 +1058,9 @@ mod tests {
             .map(|(k, v)| (*k, *v))
             .collect();
 
-        assert_eq!(excluded.len(), 2);
         assert_eq!(excluded[0].0, "fox");
         assert_eq!(excluded[1].0, "hog");
+        assert_eq!(excluded.len(), 2);
 
         let excluded: Vec<_> = store
             .get_range(&("fox", "doe").into(), None)
