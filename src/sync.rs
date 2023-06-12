@@ -37,7 +37,7 @@ impl Author {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AuthorId(VerifyingKey);
 
 impl AuthorId {
@@ -77,7 +77,7 @@ impl Namespace {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub struct NamespaceId(VerifyingKey);
 
 impl NamespaceId {
@@ -92,7 +92,37 @@ impl NamespaceId {
 
 #[derive(Debug)]
 pub struct Replica {
+    namespace: Namespace,
     entries: Vec<SignedEntry>,
+}
+
+impl Replica {
+    pub fn new(namespace: Namespace) -> Self {
+        Replica {
+            namespace,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Inserts a new record at the given key.
+    pub fn insert(&mut self, key: impl AsRef<[u8]>, author: &Author, data: impl AsRef<[u8]>) {
+        let id = RecordIdentifier::new(key, self.namespace.id(), author.id());
+        let record = Record::from_data(data, self.namespace.id());
+        let entry = Entry::new(id, record);
+        let signed_entry = entry.sign(&self.namespace, author);
+        self.entries.push(signed_entry);
+    }
+
+    /// Gets all entries matching this key and author.
+    pub fn get<'a, 'b: 'a, 'c: 'a>(
+        &'a self,
+        key: impl AsRef<[u8]> + 'c,
+        author: &'b AuthorId,
+    ) -> impl Iterator<Item = &SignedEntry> + 'a {
+        self.entries
+            .iter()
+            .filter(move |e| e.entry.id.key == key.as_ref() && &e.entry.id.author == author)
+    }
 }
 
 /// A signed entry.
@@ -111,6 +141,14 @@ impl SignedEntry {
     pub fn verify(&self) -> Result<(), SignatureError> {
         self.signature
             .verify(&self.entry, &self.entry.id.namespace, &self.entry.id.author)
+    }
+
+    pub fn signature(&self) -> &EntrySignature {
+        &self.signature
+    }
+
+    pub fn entry(&self) -> &Entry {
+        &self.entry
     }
 }
 
@@ -161,6 +199,14 @@ impl Entry {
         Entry { id, record }
     }
 
+    pub fn id(&self) -> &RecordIdentifier {
+        &self.id
+    }
+
+    pub fn record(&self) -> &Record {
+        &self.record
+    }
+
     /// Serialize this entry into its canonical byte representation used for signing.
     pub fn into_vec(&self, out: &mut Vec<u8>) {
         self.id.as_bytes(out);
@@ -203,6 +249,18 @@ impl RecordIdentifier {
         out.extend_from_slice(self.author.as_bytes());
         out.extend_from_slice(&self.key);
     }
+
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    pub fn namespace(&self) -> &NamespaceId {
+        &self.namespace
+    }
+
+    pub fn author(&self) -> &AuthorId {
+        &self.author
+    }
 }
 
 #[derive(Debug)]
@@ -221,6 +279,18 @@ impl Record {
             len,
             hash,
         }
+    }
+
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    pub fn content_len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn content_hash(&self) -> &Hash {
+        &self.hash
     }
 
     pub fn from_data(data: impl AsRef<[u8]>, namespace: &NamespaceId) -> Self {
@@ -263,5 +333,17 @@ mod tests {
         let entry = Entry::new(record_id, record);
         let signed_entry = entry.sign(&myspace, &alice);
         signed_entry.verify().expect("failed to verify");
+
+        let mut my_replica = Replica::new(myspace);
+        for i in 0..10 {
+            my_replica.insert(format!("/{i}"), &alice, format!("{i}: hello from alice"));
+        }
+
+        for i in 0..10 {
+            let res: Vec<_> = my_replica.get(format!("/{i}"), alice.id()).collect();
+            assert_eq!(res.len(), 1);
+            let len = format!("{i}: hello from alice").as_bytes().len() as u64;
+            assert_eq!(res[0].entry().record().content_len(), len);
+        }
     }
 }
