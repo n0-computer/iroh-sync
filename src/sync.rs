@@ -344,6 +344,8 @@ mod tests {
             assert_eq!(res.len(), 1);
             let len = format!("{i}: hello from alice").as_bytes().len() as u64;
             assert_eq!(res[0].entry().record().content_len(), len);
+
+            res[0].verify().expect("invalid signature");
         }
     }
 }
