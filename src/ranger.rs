@@ -5,6 +5,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::marker::PhantomData;
 
 /// Stores a range.
 ///
@@ -13,7 +14,7 @@ use std::fmt::Debug;
 /// - [x, y): x < y: Includes x, but not y
 /// - S \ [y, x) y < x: Includes x, but not y.
 /// This means that ranges are "wrap around" conceptually.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Range<K> {
     x: K,
     y: K,
@@ -152,7 +153,7 @@ where
     K: RangeKey + Clone + Default + AsFingerprint,
 {
     /// Construct the initial message.
-    fn init(store: &Store<K, V>, limit: Option<&Range<K>>) -> Self {
+    fn init<S: Store<K, V>>(store: &S, limit: Option<&Range<K>>) -> Self {
         let x = store.get_first().clone();
         let range = Range::new(x.clone(), x);
         let fingerprint = store.get_fingerprint(&range, limit);
@@ -165,24 +166,57 @@ where
     }
 }
 
+pub trait Store<K, V>: Sized + Default
+where
+    K: RangeKey + Clone + Default + AsFingerprint,
+{
+    /// Get a the first key (or the default if none is available).
+    fn get_first(&self) -> K;
+    fn get(&self, key: &K) -> Option<&V>;
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool;
+    /// Calculate the fingerprint of the given range.
+    fn get_fingerprint(&self, range: &Range<K>, limit: Option<&Range<K>>) -> Fingerprint;
+
+    /// Insert the given key value pair.
+    fn put(&mut self, k: K, v: V);
+
+    type RangeIterator<'a>: Iterator<Item = (&'a K, &'a V)>
+    where
+        Self: 'a,
+        K: 'a,
+        V: 'a;
+
+    /// Returns all items in the given range
+    fn get_range<'a>(&'a self, range: Range<K>, limit: Option<Range<K>>)
+        -> Self::RangeIterator<'a>;
+    fn remove(&mut self, key: &K) -> Option<V>;
+
+    type AllIterator<'a>: Iterator<Item = (&'a K, &'a V)>
+    where
+        Self: 'a,
+        K: 'a,
+        V: 'a;
+    fn all(&self) -> Self::AllIterator<'_>;
+}
+
 #[derive(Debug)]
-pub struct Store<K, V> {
+pub struct SimpleStore<K, V> {
     data: BTreeMap<K, V>,
 }
 
-impl<K, V> Default for Store<K, V> {
+impl<K, V> Default for SimpleStore<K, V> {
     fn default() -> Self {
-        Store {
+        SimpleStore {
             data: BTreeMap::default(),
         }
     }
 }
 
-impl<K, V> Store<K, V>
+impl<K, V> Store<K, V> for SimpleStore<K, V>
 where
     K: RangeKey + Clone + Default + AsFingerprint,
 {
-    /// Get a random element.
     fn get_first(&self) -> K {
         if let Some((k, _)) = self.data.first_key_value() {
             k.clone()
@@ -205,7 +239,7 @@ where
 
     /// Calculate the fingerprint of the given range.
     fn get_fingerprint(&self, range: &Range<K>, limit: Option<&Range<K>>) -> Fingerprint {
-        let elements = self.get_range(range, limit);
+        let elements = self.get_range(range.clone(), limit.cloned());
         let mut fp = Fingerprint::empty();
         for el in elements {
             fp ^= el.0.as_fingerprint();
@@ -219,67 +253,120 @@ where
         self.data.insert(k, v);
     }
 
+    type RangeIterator<'a> = SimpleRangeIterator<'a, K, V>
+        where K: 'a, V: 'a;
     /// Returns all items in the given range
-    fn get_range<'a, 'b: 'a, 'c: 'a>(
+    fn get_range<'a>(
         &'a self,
-        range: &'b Range<K>,
-        limit: Option<&'c Range<K>>,
-    ) -> impl Iterator<Item = (&K, &V)> + 'a {
+        range: Range<K>,
+        limit: Option<Range<K>>,
+    ) -> Self::RangeIterator<'a> {
         // TODO: this is not very efficient, optimize depending on data structure
-        self.data.iter().filter(move |(k, _)| {
-            let r = k.contains(range);
-            if let Some(limit) = limit {
-                r && k.contains(limit)
-            } else {
-                r
-            }
-        })
+        let iter = self.data.iter();
+
+        SimpleRangeIterator { iter, range, limit }
     }
 
     fn remove(&mut self, key: &K) -> Option<V> {
         self.data.remove(key)
     }
 
-    fn all(&self) -> impl Iterator<Item = (&K, &V)> {
+    type AllIterator<'a> = std::collections::btree_map::Iter<'a, K, V>
+    where K: 'a,
+          V: 'a;
+
+    fn all(&self) -> Self::AllIterator<'_> {
         self.data.iter()
     }
 }
 
+pub struct SimpleRangeIterator<'a, K: 'a, V: 'a> {
+    iter: std::collections::btree_map::Iter<'a, K, V>,
+    range: Range<K>,
+    limit: Option<Range<K>>,
+}
+
+impl<'a, K, V> Iterator for SimpleRangeIterator<'a, K, V>
+where
+    K: RangeKey,
+{
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut next = self.iter.next()?;
+
+        let filter = |x: &K| {
+            let r = x.contains(&self.range);
+            if let Some(ref limit) = self.limit {
+                r && x.contains(limit)
+            } else {
+                r
+            }
+        };
+
+        loop {
+            if filter(&next.0) {
+                return Some(next);
+            }
+
+            next = self.iter.next()?;
+        }
+    }
+}
+
 #[derive(Debug)]
-pub struct Peer<K, V> {
-    store: Store<K, V>,
+pub struct Peer<K, V, S: Store<K, V> = SimpleStore<K, V>>
+where
+    K: RangeKey + Clone + Default + AsFingerprint,
+{
+    store: S,
     /// Up to how many values to send immediately, before sending only a fingerprint.
     max_set_size: usize,
     /// `k` in the protocol, how many splits to generate. at least 2
     split_factor: usize,
     limit: Option<Range<K>>,
+
+    _phantom: PhantomData<V>, // why???
 }
 
-impl<K, V> Default for Peer<K, V> {
+impl<K, V, S> Default for Peer<K, V, S>
+where
+    K: RangeKey + Clone + Default + AsFingerprint,
+    S: Store<K, V> + Default,
+{
     fn default() -> Self {
         Peer {
-            store: Store::default(),
+            store: S::default(),
             max_set_size: 1,
             split_factor: 2,
             limit: None,
+            _phantom: Default::default(),
         }
     }
 }
 
-impl<K, V> Peer<K, V>
+impl<K, V, S> Peer<K, V, S>
 where
     K: PartialEq + RangeKey + Clone + Default + Debug + AsFingerprint,
     V: Clone + Debug,
+    S: Store<K, V> + Default,
 {
     pub fn with_limit(limit: Range<K>) -> Self {
         Peer {
-            store: Store::default(),
+            store: S::default(),
             max_set_size: 1,
             split_factor: 2,
             limit: Some(limit),
+            _phantom: Default::default(),
         }
     }
-
+}
+impl<K, V, S> Peer<K, V, S>
+where
+    K: PartialEq + RangeKey + Clone + Default + Debug + AsFingerprint,
+    V: Clone + Debug,
+    S: Store<K, V>,
+{
     /// Generates the initial message.
     pub fn initial_message(&self) -> Message<K, V> {
         Message::init(&self.store, self.limit.as_ref())
@@ -316,7 +403,7 @@ where
             } else {
                 Some(
                     self.store
-                        .get_range(&range, self.limit.as_ref())
+                        .get_range(range.clone(), self.limit.clone())
                         .into_iter()
                         .filter(|(k, _)| values.iter().find(|(vk, _)| &vk == k).is_none())
                         .map(|(k, v)| (k.clone(), v.clone()))
@@ -350,7 +437,10 @@ where
             }
 
             // Case2 Recursion Anchor
-            let local_values: Vec<_> = self.store.get_range(&range, self.limit.as_ref()).collect();
+            let local_values: Vec<_> = self
+                .store
+                .get_range(range.clone(), self.limit.clone())
+                .collect();
             if local_values.len() <= 1 || fingerprint == Fingerprint::empty() {
                 let values = local_values
                     .into_iter()
@@ -397,7 +487,10 @@ where
                 }
 
                 for range in ranges.into_iter() {
-                    let chunk: Vec<_> = self.store.get_range(&range, self.limit.as_ref()).collect();
+                    let chunk: Vec<_> = self
+                        .store
+                        .get_range(range.clone(), self.limit.clone())
+                        .collect();
                     // Add either the fingerprint or the item set
                     let fingerprint = self.store.get_fingerprint(&range, self.limit.as_ref());
                     if chunk.len() > self.max_set_size {
@@ -811,7 +904,10 @@ mod tests {
         );
     }
 
-    struct SyncResult<K, V> {
+    struct SyncResult<K, V>
+    where
+        K: RangeKey + Clone + Default + AsFingerprint,
+    {
         alice: Peer<K, V>,
         bob: Peer<K, V>,
         alice_to_bob: Vec<Message<K, V>>,
@@ -820,7 +916,7 @@ mod tests {
 
     impl<K, V> SyncResult<K, V>
     where
-        K: Debug,
+        K: RangeKey + Clone + Default + AsFingerprint + Debug,
         V: Debug,
     {
         fn print_messages(&self) {
@@ -1029,7 +1125,7 @@ mod tests {
 
     #[test]
     fn store_get_range() {
-        let mut store = Store::<&'static str, usize>::default();
+        let mut store = SimpleStore::<&'static str, usize>::default();
         let set = [
             ("bee", 1),
             ("cat", 1),
@@ -1043,14 +1139,14 @@ mod tests {
         }
 
         let all: Vec<_> = store
-            .get_range(&Range::new("", ""), None)
+            .get_range(Range::new("", ""), None)
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
         assert_eq!(&all, &set[..]);
 
         let regular: Vec<_> = store
-            .get_range(&("bee", "eel").into(), None)
+            .get_range(("bee", "eel").into(), None)
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
@@ -1058,21 +1154,21 @@ mod tests {
 
         // empty start
         let regular: Vec<_> = store
-            .get_range(&("", "eel").into(), None)
+            .get_range(("", "eel").into(), None)
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
         assert_eq!(&regular, &set[..3]);
 
         let regular: Vec<_> = store
-            .get_range(&("cat", "hog").into(), None)
+            .get_range(("cat", "hog").into(), None)
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
         assert_eq!(&regular, &set[1..5]);
 
         let excluded: Vec<_> = store
-            .get_range(&("fox", "bee").into(), None)
+            .get_range(("fox", "bee").into(), None)
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
@@ -1082,7 +1178,7 @@ mod tests {
         assert_eq!(excluded.len(), 2);
 
         let excluded: Vec<_> = store
-            .get_range(&("fox", "doe").into(), None)
+            .get_range(("fox", "doe").into(), None)
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
@@ -1095,7 +1191,7 @@ mod tests {
 
         // Limit
         let all: Vec<_> = store
-            .get_range(&("", "").into(), Some(&("bee", "doe").into()))
+            .get_range(("", "").into(), Some(("bee", "doe").into()))
             .into_iter()
             .map(|(k, v)| (*k, *v))
             .collect();
