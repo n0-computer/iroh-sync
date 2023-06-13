@@ -4,13 +4,17 @@
 //
 // This is going to change!
 
-use std::{cmp::Ordering, collections::HashMap, time::SystemTime};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap},
+    time::SystemTime,
+};
 
 use blake3::Hash;
 use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, VerifyingKey};
 use rand_core::CryptoRngCore;
 
-use crate::ranger::{AsFingerprint, Fingerprint, Peer, RangeKey};
+use crate::ranger::{AsFingerprint, Fingerprint, Peer, Range, RangeKey};
 
 #[derive(Debug)]
 pub struct Author {
@@ -95,8 +99,132 @@ impl NamespaceId {
 #[derive(Debug)]
 pub struct Replica {
     namespace: Namespace,
-    peer: Peer<RecordIdentifier, SignedEntry>,
+    peer: Peer<RecordIdentifier, SignedEntry, Store>,
     content: HashMap<Hash, Vec<u8>>,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct Store {
+    /// Stores records by identifier + timestamp
+    records: BTreeMap<RecordIdentifier, BTreeMap<u64, SignedEntry>>,
+}
+
+impl Store {
+    pub fn latest(&self) -> impl Iterator<Item = (&RecordIdentifier, &SignedEntry)> {
+        self.records.iter().filter_map(|(k, values)| {
+            let (_, v) = values.last_key_value()?;
+            Some((k, v))
+        })
+    }
+}
+
+impl crate::ranger::Store<RecordIdentifier, SignedEntry> for Store {
+    /// Get a the first key (or the default if none is available).
+    fn get_first(&self) -> RecordIdentifier {
+        self.records
+            .first_key_value()
+            .map(|(k, _)| k.clone())
+            .unwrap_or_default()
+    }
+
+    fn get(&self, key: &RecordIdentifier) -> Option<&SignedEntry> {
+        self.records
+            .get(key)
+            .and_then(|values| values.last_key_value())
+            .map(|(_, v)| v)
+    }
+
+    fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    fn get_fingerprint(
+        &self,
+        range: &Range<RecordIdentifier>,
+        limit: Option<&Range<RecordIdentifier>>,
+    ) -> Fingerprint {
+        let elements = self.get_range(range.clone(), limit.cloned());
+        let mut fp = Fingerprint::empty();
+        for el in elements {
+            fp ^= el.0.as_fingerprint();
+        }
+
+        fp
+    }
+
+    fn put(&mut self, k: RecordIdentifier, v: SignedEntry) {
+        // TODO: propagate error/not insertion?
+        if v.verify().is_ok() {
+            let timestamp = v.entry().record().timestamp();
+            // TODO: verify timestamp is "reasonable"
+
+            self.records.entry(k).or_default().insert(timestamp, v);
+        }
+    }
+
+    type RangeIterator<'a> = RangeIterator<'a>;
+    fn get_range<'a>(
+        &'a self,
+        range: Range<RecordIdentifier>,
+        limit: Option<Range<RecordIdentifier>>,
+    ) -> Self::RangeIterator<'a> {
+        RangeIterator {
+            iter: self.records.iter(),
+            range: Some(range),
+            limit,
+        }
+    }
+
+    fn remove(&mut self, key: &RecordIdentifier) -> Option<SignedEntry> {
+        self.records
+            .remove(key)
+            .and_then(|mut v| v.last_entry().map(|e| e.remove_entry().1))
+    }
+
+    type AllIterator<'a> = RangeIterator<'a>;
+
+    fn all(&self) -> Self::AllIterator<'_> {
+        RangeIterator {
+            iter: self.records.iter(),
+            range: None,
+            limit: None,
+        }
+    }
+}
+
+pub struct RangeIterator<'a> {
+    iter: std::collections::btree_map::Iter<'a, RecordIdentifier, BTreeMap<u64, SignedEntry>>,
+    range: Option<Range<RecordIdentifier>>,
+    limit: Option<Range<RecordIdentifier>>,
+}
+
+impl<'a> RangeIterator<'a> {
+    fn matches(&self, x: &RecordIdentifier) -> bool {
+        let range = self.range.as_ref().map(|r| x.contains(r)).unwrap_or(true);
+        let limit = self.limit.as_ref().map(|r| x.contains(r)).unwrap_or(true);
+        range && limit
+    }
+}
+
+impl<'a> Iterator for RangeIterator<'a> {
+    type Item = (&'a RecordIdentifier, &'a SignedEntry);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut next = self.iter.next()?;
+        loop {
+            if self.matches(&next.0) {
+                let (k, values) = next;
+                let (_, v) = values.last_key_value()?;
+                return Some((k, v));
+            }
+
+            next = self.iter.next()?;
+        }
+    }
 }
 
 impl Replica {
@@ -106,6 +234,10 @@ impl Replica {
             peer: Peer::default(),
             content: HashMap::default(),
         }
+    }
+
+    pub fn get_content(&self, hash: &Hash) -> Option<&[u8]> {
+        self.content.get(hash).map(|v| v.as_ref())
     }
 
     /// Inserts a new record at the given key.
@@ -124,21 +256,29 @@ impl Replica {
     }
 
     /// Gets all entries matching this key and author.
-    pub fn get<'a, 'b: 'a, 'c: 'a>(
-        &'a self,
-        key: impl AsRef<[u8]> + 'c,
-        author: &'b AuthorId,
-    ) -> impl Iterator<Item = &SignedEntry> + 'a {
-        self.peer.all().filter_map(move |(_, e)| {
-            if e.entry.id.key == key.as_ref() && &e.entry.id.author == author {
-                Some(e)
-            } else {
-                None
-            }
-        })
+    pub fn get_latest(&self, key: impl AsRef<[u8]>, author: &AuthorId) -> Option<&SignedEntry> {
+        self.peer
+            .get(&RecordIdentifier::new(key, &self.namespace.id(), author))
     }
 
-    pub fn peer_mut(&mut self) -> &mut Peer<RecordIdentifier, SignedEntry> {
+    /// Returns all versions of the matching documents.
+    pub fn get_all<'a, 'b: 'a>(
+        &'a self,
+        key: impl AsRef<[u8]> + 'b,
+        author: &AuthorId,
+    ) -> impl Iterator<Item = &SignedEntry> + 'a {
+        let author = *author;
+        self.peer
+            .store()
+            .records
+            .iter()
+            .filter(move |(k, _)| {
+                k.key == key.as_ref() && &k.namespace == self.namespace.id() && k.author == author
+            })
+            .flat_map(|(_, v)| v.values())
+    }
+
+    pub fn peer_mut(&mut self) -> &mut Peer<RecordIdentifier, SignedEntry, Store> {
         &mut self.peer
     }
 
@@ -423,13 +563,40 @@ mod tests {
         }
 
         for i in 0..10 {
-            let res: Vec<_> = my_replica.get(format!("/{i}"), alice.id()).collect();
-            assert_eq!(res.len(), 1);
+            let res = my_replica.get_latest(format!("/{i}"), alice.id()).unwrap();
             let len = format!("{i}: hello from alice").as_bytes().len() as u64;
-            assert_eq!(res[0].entry().record().content_len(), len);
-
-            res[0].verify().expect("invalid signature");
+            assert_eq!(res.entry().record().content_len(), len);
+            res.verify().expect("invalid signature");
         }
+
+        // Test multiple records for the same key
+        my_replica.insert("/cool/path", &alice, "round 1");
+        let entry = my_replica.get_latest("/cool/path", alice.id()).unwrap();
+        let content = my_replica
+            .get_content(entry.entry().record().content_hash())
+            .unwrap();
+        assert_eq!(content, b"round 1");
+
+        // Second
+
+        my_replica.insert("/cool/path", &alice, "round 2");
+        let entry = my_replica.get_latest("/cool/path", alice.id()).unwrap();
+        let content = my_replica
+            .get_content(entry.entry().record().content_hash())
+            .unwrap();
+        assert_eq!(content, b"round 2");
+
+        // Get All
+        let entries: Vec<_> = my_replica.get_all("/cool/path", alice.id()).collect();
+        assert_eq!(entries.len(), 2);
+        let content = my_replica
+            .get_content(entries[0].entry().record().content_hash())
+            .unwrap();
+        assert_eq!(content, b"round 1");
+        let content = my_replica
+            .get_content(entries[1].entry().record().content_hash())
+            .unwrap();
+        assert_eq!(content, b"round 2");
     }
 
     #[test]
@@ -477,33 +644,13 @@ mod tests {
 
         // Check result
         for el in alice_set {
-            assert_eq!(
-                alice.get(el, author.id()).collect::<Vec<_>>().len(),
-                1,
-                "{}",
-                el
-            );
-            assert_eq!(
-                bob.get(el, author.id()).collect::<Vec<_>>().len(),
-                1,
-                "{}",
-                el
-            );
+            alice.get_latest(el, author.id()).unwrap();
+            bob.get_latest(el, author.id()).unwrap();
         }
 
         for el in bob_set {
-            assert_eq!(
-                alice.get(el, author.id()).collect::<Vec<_>>().len(),
-                1,
-                "{}",
-                el
-            );
-            assert_eq!(
-                bob.get(el, author.id()).collect::<Vec<_>>().len(),
-                1,
-                "{}",
-                el
-            );
+            alice.get_latest(el, author.id()).unwrap();
+            bob.get_latest(el, author.id()).unwrap();
         }
     }
 }

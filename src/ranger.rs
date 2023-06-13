@@ -75,11 +75,11 @@ impl Debug for Fingerprint {
 
 impl Fingerprint {
     /// The fingerprint of the empty set
-    fn empty() -> Self {
+    pub fn empty() -> Self {
         Fingerprint::new(&[][..])
     }
 
-    fn new<T: AsFingerprint>(val: T) -> Self {
+    pub fn new<T: AsFingerprint>(val: T) -> Self {
         val.as_fingerprint()
     }
 }
@@ -530,6 +530,10 @@ where
         self.store.put(k, v);
     }
 
+    pub fn get(&self, k: &K) -> Option<&V> {
+        self.store.get(k)
+    }
+
     /// Remove the given key.
     pub fn remove(&mut self, k: &K) -> Option<V> {
         self.store.remove(k)
@@ -538,6 +542,11 @@ where
     /// List all existing key value pairs.
     pub fn all(&self) -> impl Iterator<Item = (&K, &V)> {
         self.store.all()
+    }
+
+    /// Returns a refernce to the underlying store.
+    pub fn store(&self) -> &S {
+        &self.store
     }
 }
 
