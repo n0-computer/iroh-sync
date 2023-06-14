@@ -1,5 +1,5 @@
 //! Implementation of the Plumtree epidemic broadcast tree protocol
-//! 
+//!
 //! The implementation is based on [this paper][paper] by Joao Leitao, Jose Pereira, Luıs Rodrigues
 //! and the [example implementation][impl] by Bartosz Sypytkowski
 //!
@@ -85,10 +85,17 @@ impl Round {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Message {
+    /// When receiving Gossip, emit as event and forward full message to eager peer
+    /// and (after a delay) message IDs to lazy peers.
     Gossip(Gossip),
+    /// When receiving Prune, move the peer from the eager to the lazy set
     Prune,
-    IHave(Vec<IHave>),
+    /// When receiving Graft, move the peer to the eager set and send the full content for the
+    /// included message ID.
     Graft(Graft),
+    /// When receiving IHave, do nothing initially, and request the messages for the included
+    /// message IDs after some time if they aren't pushed eagerly to us.
+    IHave(Vec<IHave>),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -164,6 +171,8 @@ impl<PA: PeerAddress> State<PA> {
         }
     }
 
+    // TODO: optimization step from the paper
+
     pub fn handle(&mut self, event: InEvent<PA>, io: &mut impl IO<PA>) {
         match event {
             InEvent::Message(from, message) => self.handle_message(from, message, io),
@@ -227,8 +236,6 @@ impl<PA: PeerAddress> State<PA> {
         self.received_messages.insert(id);
         self.cache.insert(id, message);
     }
-
-    // TODO: do_optimize
 
     fn on_gossip(&mut self, sender: PA, message: Gossip, io: &mut impl IO<PA>) {
         if self.received_messages.contains(&message.id) {

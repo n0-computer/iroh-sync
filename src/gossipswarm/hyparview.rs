@@ -56,10 +56,11 @@ pub enum Message<PA> {
     /// Request to add sender to an active view of recipient. If `highPriority` is set, it cannot
     /// be denied.
     Neighbor(Neighbor),
-    /// Disconnect request. If `alive` is set, sender can safely be added to passive set for future
-    /// reconnections.
-    /// If `response` is set, recipient should answer with its own `Disconnect` (with
-    /// respond=false) as well.
+    /// Request to disconnect from a peer.
+    /// If `alive` is true, the other peer is not shutting down, so it should be added to the
+    /// passive set.
+    /// If `respond` is true, the peer should answer the disconnect request before shutting down
+    /// the connection.
     Disconnect(Disconnect),
 }
 
