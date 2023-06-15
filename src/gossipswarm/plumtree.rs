@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use super::{PeerAddress, IO};
 
 pub enum InEvent<PA> {
-    Message(PA, Message),
+    RecvMessage(PA, Message),
     Broadcast(Bytes),
     TimerExpired(Timer),
     NeighborUp(PA),
@@ -70,7 +70,9 @@ impl fmt::Display for MessageId {
 }
 impl fmt::Debug for MessageId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Id({})", self)
+        let mut text = data_encoding::BASE32_NOPAD.encode(&self.0);
+        text.make_ascii_lowercase();
+        write!(f, "{}…{}", &text[..5], &text[(text.len() - 2)..])
     }
 }
 
@@ -175,7 +177,7 @@ impl<PA: PeerAddress> State<PA> {
 
     pub fn handle(&mut self, event: InEvent<PA>, io: &mut impl IO<PA>) {
         match event {
-            InEvent::Message(from, message) => self.handle_message(from, message, io),
+            InEvent::RecvMessage(from, message) => self.handle_message(from, message, io),
             InEvent::Broadcast(data) => self.do_broadcast(data, io),
             InEvent::NeighborUp(peer) => self.on_neighbor_up(peer),
             InEvent::NeighborDown(peer) => self.on_neighbor_down(peer),

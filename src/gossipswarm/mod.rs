@@ -18,7 +18,7 @@ impl<T> PeerAddress for T where T: Hash + Eq + Copy + fmt::Debug + Serialize + D
 #[derive(Debug)]
 pub enum InEvent<PA> {
     /// Message received from the network.
-    Message(PA, Message<PA>),
+    RecvMessage(PA, Message<PA>),
     /// Execute a command from the application.
     Command(Command<PA>),
     /// Trigger a previously scheduled timer.
@@ -160,10 +160,12 @@ impl<PA: PeerAddress> State<PA> {
                 Command::Join(peer) => self.swarm.handle(SwarmIn::RequestJoin(peer), io),
                 Command::Broadcast(data) => self.gossip.handle(GossipIn::Broadcast(data), io),
             },
-            InEvent::Message(from, message) => match message {
-                Message::Swarm(message) => self.swarm.handle(SwarmIn::Message(from, message), io),
+            InEvent::RecvMessage(from, message) => match message {
+                Message::Swarm(message) => {
+                    self.swarm.handle(SwarmIn::RecvMessage(from, message), io)
+                }
                 Message::Gossip(message) => {
-                    self.gossip.handle(GossipIn::Message(from, message), io)
+                    self.gossip.handle(GossipIn::RecvMessage(from, message), io)
                 }
             },
             InEvent::TimerExpired(timer) => match timer {
@@ -176,8 +178,8 @@ impl<PA: PeerAddress> State<PA> {
         }
 
         // Forward NeigborUp and NeighborDown events from hyparview to plumtree
+        let mut io = VecDeque::new();
         for event in self.outbox.iter() {
-            let mut io = VecDeque::new();
             match event {
                 OutEvent::EmitEvent(Event::NeighborUp(peer)) => self
                     .gossip
@@ -188,6 +190,10 @@ impl<PA: PeerAddress> State<PA> {
                 _ => {}
             }
         }
+        // Note that this is a no-op because plumtree::handle(NeighborUp | NeighborDown)
+        // above does not emit any OutEvents.
+        self.outbox.extend(io.drain(..));
+
         self.outbox.drain(..)
     }
 }
@@ -199,7 +205,9 @@ mod test {
         time::{Duration, Instant},
     };
 
-    use super::{Command, Config, Event, InEvent, Message, OutEvent, PeerAddress, State, Timer};
+    use tracing::debug;
+
+    use super::{Command, Config, Event, InEvent, OutEvent, PeerAddress, State, Timer};
 
     #[test]
     fn hyparview_smoke() {
@@ -211,11 +219,11 @@ mod test {
             network.push(State::new(i, config.clone()));
         }
 
-        // Do some joins between nodes 0,1,2 and wait 3 ticks
+        // Do some joins between nodes 0,1,2
         network.command(0, Command::Join(1));
         network.command(0, Command::Join(2));
         network.command(1, Command::Join(2));
-        network.ticks(2);
+        network.ticks(3);
 
         // Confirm emitted events
         let actual = network.events_sorted();
@@ -235,7 +243,7 @@ mod test {
         // Now let node 3 join node 0.
         // Node 0 is full, so it will disconnect from either node 1 or node 2.
         network.command(3, Command::Join(0));
-        network.ticks(2);
+        network.ticks(3);
 
         // Confirm emitted events. There's two options because whether node 0 disconnects from
         // node 1 or node 2 is random.
@@ -291,12 +299,12 @@ mod test {
 
         // now connect the two sections of the swarm
         network.command(2, Command::Join(5));
-        network.ticks(4);
+        network.ticks(3);
         let _ = network.events();
 
         // now broadcast again
         network.command(1, Command::Broadcast(b"hi2".to_vec().into()));
-        network.ticks(8);
+        network.ticks(4);
         let events = network.events();
         let received: Vec<_> = events
             .filter(|x| matches!(x, (_, Event::Received(_))))
@@ -311,11 +319,13 @@ mod test {
     /// Stores events in VecDeques and processes on ticks.
     /// Timers are checked after each tick. The local time is increased with TICK_DURATION before
     /// each tick.
+    /// Note: Panics when sending to an unknown peer.
     struct Network<PA> {
+        start: Instant,
         time: Instant,
         tick_duration: Duration,
         outqueue: Vec<(PA, OutEvent<PA>)>,
-        inqueues: HashMap<PA, VecDeque<(PA, Message<PA>)>>,
+        inqueues: HashMap<PA, VecDeque<InEvent<PA>>>,
         peers: HashMap<PA, State<PA>>,
         conns: HashSet<ConnId<PA>>,
         events: VecDeque<(PA, Event<PA>)>,
@@ -324,6 +334,7 @@ mod test {
     impl<PA> Network<PA> {
         pub fn new(time: Instant) -> Self {
             Self {
+                start: time,
                 time,
                 tick_duration: TICK_DURATION,
                 outqueue: Default::default(),
@@ -334,6 +345,14 @@ mod test {
                 timers: TimerMap::new(),
             }
         }
+    }
+
+    fn push_back<PA: Eq + std::hash::Hash>(
+        inqueues: &mut HashMap<PA, VecDeque<InEvent<PA>>>,
+        peer: &PA,
+        event: InEvent<PA>,
+    ) {
+        inqueues.get_mut(&peer).unwrap().push_back(event);
     }
 
     impl<PA: PeerAddress + Ord> Network<PA> {
@@ -355,56 +374,52 @@ mod test {
         }
 
         pub fn command(&mut self, peer: PA, command: Command<PA>) {
-            self.handle(peer, InEvent::Command(command));
+            debug!(?peer, "~~ COMMAND {command:?}");
+            push_back(&mut self.inqueues, &peer, InEvent::Command(command));
         }
 
         pub fn ticks(&mut self, n: usize) {
             (0..n).for_each(|_| self.tick())
         }
 
+        pub fn get_tick(&self) -> u32 {
+            ((self.time - self.start) / self.tick_duration.as_millis() as u32).as_millis() as u32
+        }
+
         pub fn tick(&mut self) {
-            // process outqueue (might have entries from commands)
-            self.process_outqueue();
-            // process timers
             self.time += self.tick_duration;
+            debug!(tick = self.get_tick(), "~~ TICK");
+            // process timers
             for (_time, (peer, timer)) in self.timers.drain_until(&self.time) {
-                self.handle(peer, InEvent::TimerExpired(timer));
+                push_back(&mut self.inqueues, &peer, InEvent::TimerExpired(timer));
             }
-            // process messages
-            for (peer, state) in self.peers.iter_mut() {
-                let queue = self.inqueues.get_mut(peer).unwrap();
-                while let Some((from, message)) = queue.pop_front() {
-                    // eprintln!("{from:?} -> {peer:?}: {message:?}");
-                    let out = state.handle(InEvent::Message(from, message));
+            // process inqueues
+            for (peer, queue) in self.inqueues.iter_mut() {
+                let state = self.peers.get_mut(&peer).unwrap();
+                while let Some(event) = queue.pop_front() {
+                    debug!(peer = ?peer, "handle {event:?}");
+                    let out = state.handle(event);
                     self.outqueue.extend(out.map(|ev| (*peer, ev)));
                 }
             }
-            // process outqueue again
-            self.process_outqueue();
-        }
-
-        fn handle(&mut self, peer: PA, event: InEvent<PA>) {
-            let out = self.peers.get_mut(&peer).unwrap().handle(event);
-            self.outqueue.extend(out.map(|ev| (peer, ev)));
-        }
-
-        fn process_outqueue(&mut self) {
+            // process outqueue
             for (from, event) in self.outqueue.drain(..) {
                 match event {
                     OutEvent::SendMessage(to, message) => {
                         self.conns.insert((from, to).into());
-                        let queue = self.inqueues.get_mut(&to).unwrap();
-                        queue.push_back((from, message));
+                        push_back(&mut self.inqueues, &to, InEvent::RecvMessage(from, message));
                     }
                     OutEvent::ScheduleTimer(delay, timer) => {
-                        let instant = self.time + delay;
-                        self.timers.insert(instant, (from, timer));
+                        self.timers.insert(self.time + delay, (from, timer));
                     }
                     OutEvent::DisconnectPeer(to) => {
+                        debug!(peer = ?from, other = ?to, "disconnect");
                         self.conns.remove(&(from, to).into());
+                        push_back(&mut self.inqueues, &from, InEvent::PeerDisconnected(to));
+                        push_back(&mut self.inqueues, &to, InEvent::PeerDisconnected(from));
                     }
                     OutEvent::EmitEvent(event) => {
-                        // eprintln!("EVENT {from:?} {event:?}");
+                        debug!(peer = ?from, "emit   {event:?}");
                         self.events.push_back((from, event));
                     }
                 }

@@ -17,7 +17,7 @@ use super::{util::IndexSet, PeerAddress, IO};
 
 #[derive(Debug)]
 pub enum InEvent<PA> {
-    Message(PA, Message<PA>),
+    RecvMessage(PA, Message<PA>),
     TimerExpired(Timer),
     PeerDisconnected(PA),
     RequestJoin(PA),
@@ -176,7 +176,7 @@ where
 {
     pub fn handle(&mut self, event: InEvent<PA>, io: &mut impl IO<PA>) {
         match event {
-            InEvent::Message(from, message) => self.handle_message(from, message, io),
+            InEvent::RecvMessage(from, message) => self.handle_message(from, message, io),
             InEvent::TimerExpired(timer) => match timer {
                 Timer::DoShuffle => self.do_shuffle(io),
             },
@@ -266,7 +266,7 @@ where
             ));
             self.shuffle_scheduled = true;
         }
-        if details.high_priority || !self.passive_is_full() {
+        if details.high_priority || !self.active_is_full() {
             self.add_active(from, details.high_priority, io)
         }
     }
