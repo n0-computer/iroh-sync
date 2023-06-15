@@ -146,14 +146,18 @@ impl Default for Config {
 #[derive(Debug)]
 pub struct State<PA> {
     me: PA,
+    config: Config,
+
     eager_push_peers: HashSet<PA>,
     lazy_push_peers: HashSet<PA>,
-    lazy_queue: VecDeque<LazyPush<PA>>,
-    config: Config,
+
+    lazy_push_queue: HashMap<PA, Vec<IHave>>,
+
     missing_messages: IndexSet<LazyPush<PA>>,
     received_messages: IndexSet<MessageId>,
-    timers: HashSet<MessageId>,
     cache: HashMap<MessageId, Gossip>,
+
+    timers: HashSet<MessageId>,
     dispatch_timer_scheduled: bool,
 }
 
@@ -163,7 +167,7 @@ impl<PA: PeerAddress> State<PA> {
             me,
             eager_push_peers: Default::default(),
             lazy_push_peers: Default::default(),
-            lazy_queue: Default::default(),
+            lazy_push_queue: Default::default(),
             config,
             missing_messages: Default::default(),
             received_messages: Default::default(),
@@ -201,21 +205,7 @@ impl<PA: PeerAddress> State<PA> {
 
     /// Dispatches messages from lazy queue over to lazy peers.
     fn on_dispatch_timer(&mut self, io: &mut impl IO<PA>) {
-        let gossips = {
-            let mut map = HashMap::new();
-            for LazyPush { id, round, peer } in self.lazy_queue.drain(..) {
-                let message = IHave { id, round };
-                match map.get_mut(&peer) {
-                    None => {
-                        map.insert(peer, vec![message]);
-                    }
-                    Some(list) => list.push(message),
-                };
-            }
-            map
-        };
-
-        for (peer, list) in gossips {
+        for (peer, list) in self.lazy_push_queue.drain() {
             io.push(OutEvent::SendMessage(peer, Message::IHave(list)));
         }
 
@@ -348,11 +338,10 @@ impl<PA: PeerAddress> State<PA> {
     /// IHave message once dispatch trigger activates (it's cyclic operation).
     fn lazy_push(&mut self, gossip: Gossip, sender: &PA, io: &mut impl IO<PA>) {
         for peer in self.lazy_push_peers.iter().filter(|x| *x != sender) {
-            self.lazy_queue.push_back(LazyPush {
-                peer: peer.clone(),
-                round: gossip.round,
+            self.lazy_push_queue.entry(*peer).or_default().push(IHave {
                 id: gossip.id,
-            })
+                round: gossip.round,
+            });
         }
         if !self.dispatch_timer_scheduled {
             io.push(OutEvent::ScheduleTimer(
