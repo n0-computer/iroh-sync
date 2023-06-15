@@ -120,7 +120,7 @@ pub struct Config {
     pub passive_view_capacity: usize,
     pub active_random_walk_length: Ttl,
     pub passive_random_walk_length: Ttl,
-    pub shuffle_ttl: Ttl,
+    pub shuffle_random_walk_length: Ttl,
     pub shuffle_active_view_count: usize,
     pub shuffle_passive_view_count: usize,
     pub shuffle_interval: Duration,
@@ -129,12 +129,12 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             active_view_capacity: 5,
-            passive_view_capacity: 24,
-            active_random_walk_length: Ttl(5),
-            passive_random_walk_length: Ttl(2),
-            shuffle_ttl: Ttl(2),
-            shuffle_active_view_count: 2,
-            shuffle_passive_view_count: 2,
+            passive_view_capacity: 30,
+            active_random_walk_length: Ttl(6),
+            passive_random_walk_length: Ttl(3),
+            shuffle_random_walk_length: Ttl(6),
+            shuffle_active_view_count: 3,
+            shuffle_passive_view_count: 4,
             shuffle_interval: Duration::from_secs(60),
         }
     }
@@ -175,6 +175,14 @@ where
     RG: Rng,
 {
     pub fn handle(&mut self, event: InEvent<PA>, io: &mut impl IO<PA>) {
+        // this will only happen on the first call. maybe put into an Message::Init step instead
+        if !self.shuffle_scheduled {
+            io.push(OutEvent::ScheduleTimer(
+                self.config.shuffle_interval,
+                Timer::DoShuffle,
+            ));
+            self.shuffle_scheduled = true;
+        }
         match event {
             InEvent::RecvMessage(from, message) => self.handle_message(from, message, io),
             InEvent::TimerExpired(timer) => match timer {
@@ -183,6 +191,14 @@ where
             InEvent::PeerDisconnected(peer) => self.handle_disconnect(peer, io),
             InEvent::RequestJoin(peer) => self.handle_join(peer, io),
         }
+    }
+
+    pub fn active_view(&self) -> impl Iterator<Item = &PA> {
+        self.active_view.iter()
+    }
+
+    pub fn passive_view(&self) -> impl Iterator<Item = &PA> {
+        self.passive_view.iter()
     }
 
     fn handle_message(&mut self, from: PA, message: Message<PA>, io: &mut impl IO<PA>) {
@@ -224,7 +240,16 @@ where
     }
 
     fn on_join(&mut self, peer: PA, io: &mut impl IO<PA>) {
+        // "A node that receives a join request will start by adding the new
+        // node to its active view, even if it has to drop a random node from it. (6)"
         self.add_active(peer.clone(), true, io);
+        // "The contact node c will then send to all other nodes in its active view a ForwardJoin
+        // request containing the new node identifier. Associated to the join procedure,
+        // there are two configuration parameters, named Active Random Walk Length (ARWL),
+        // that specifies the maximum number of hops a ForwardJoin request is propagated,
+        // and Passive Random Walk Length (PRWL), that specifies at which point in the walk the node
+        // is inserted in a passive view. To use these parameters, the ForwardJoin request carries
+        // a “time to live” field that is initially set to ARWL and decreased at every hop. (7)"
         let ttl = self.config.active_random_walk_length;
         for node in self.active_view.iter_without(&peer) {
             let message = Message::ForwardJoin(ForwardJoin {
@@ -236,12 +261,20 @@ where
     }
 
     fn on_forward_join(&mut self, sender: PA, message: ForwardJoin<PA>, io: &mut impl IO<PA>) {
-        if message.ttl.expired() || self.active_view.is_empty() {
+        // "i) If the time to live is equal to zero or if the number of nodes in p’s active view is equal to one,
+        // it will add the new node to its active view (7)"
+        if message.ttl.expired() || self.active_view.len() <= 1 {
             self.add_active(message.peer, true, io);
         } else {
+            // "ii) If the time to live is equal to PRWL, p will insert the new node into its passive view"
             if message.ttl == self.config.passive_random_walk_length {
                 self.add_passive(message.peer);
             }
+            // "iii) The time to live field is decremented."
+            let ttl = message.ttl.next();
+            // "iv) If, at this point, n has not been inserted
+            // in p’s active view, p will forward the request to a random node in its active view
+            // (different from the one from which the request was received)."
             match self
                 .active_view
                 .pick_random_without(&[&sender], &mut self.rng)
@@ -250,7 +283,7 @@ where
                 Some(next) => {
                     let message = Message::ForwardJoin(ForwardJoin {
                         peer: message.peer,
-                        ttl: message.ttl.next(),
+                        ttl,
                     });
                     io.push(OutEvent::SendMessage(*next, message));
                 }
@@ -259,13 +292,10 @@ where
     }
 
     fn on_neighbor(&mut self, from: PA, details: Neighbor, io: &mut impl IO<PA>) {
-        if !self.shuffle_scheduled {
-            io.push(OutEvent::ScheduleTimer(
-                self.config.shuffle_interval,
-                Timer::DoShuffle,
-            ));
-            self.shuffle_scheduled = true;
-        }
+        // "A node q that receives a high priority neighbor request will always accept the request, even
+        // if it has to drop a random member from its active view (again, the member that is dropped will
+        // receive a Disconnect notification). If a node q receives a low priority Neighbor request, it will
+        // only accept the request if it has a free slot in its active view, otherwise it will refuse the request."
         if details.high_priority || !self.active_is_full() {
             self.add_active(from, details.high_priority, io)
         }
@@ -331,15 +361,13 @@ where
                 self.config.shuffle_passive_view_count,
                 &mut self.rng,
             );
-            let mut nodes = HashSet::new();
+            let mut nodes = Vec::new();
             nodes.extend(active);
             nodes.extend(passive);
             let message = Shuffle {
                 origin: self.me.clone(),
-                nodes: HashSet::<PA>::from_iter(nodes.into_iter())
-                    .into_iter()
-                    .collect(),
-                ttl: self.config.shuffle_ttl,
+                nodes,
+                ttl: self.config.shuffle_random_walk_length,
             };
             io.push(OutEvent::SendMessage(*node, Message::Shuffle(message)));
         }
