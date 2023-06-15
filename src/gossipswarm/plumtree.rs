@@ -106,6 +106,15 @@ pub struct Gossip {
     round: Round,
     content: Bytes,
 }
+impl Gossip {
+    pub fn next_round(self) -> Gossip {
+        Gossip {
+            id: self.id,
+            content: self.content,
+            round: self.round.next(),
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct IHave {
@@ -119,26 +128,19 @@ pub struct Graft {
     round: Round,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct LazyPush<PA> {
-    id: MessageId,
-    round: Round,
-    peer: PA,
-}
-
 #[derive(Clone, Debug)]
 pub struct Config {
-    graft_timeout: Duration,
-    ihave_timeout: Duration,
+    graft_timeout_1: Duration,
+    graft_timeout_2: Duration,
     dispatch_timeout: Duration,
     // optimization_threshold: Round,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
-            graft_timeout: Duration::from_secs(1),
-            ihave_timeout: Duration::from_millis(30),
-            dispatch_timeout: Duration::from_millis(30), // optimization_threshold: Round(5),
+            graft_timeout_1: Duration::from_millis(80),
+            graft_timeout_2: Duration::from_secs(40),
+            dispatch_timeout: Duration::from_millis(20), // optimization_threshold: Round(5),
         }
     }
 }
@@ -153,11 +155,12 @@ pub struct State<PA> {
 
     lazy_push_queue: HashMap<PA, Vec<IHave>>,
 
-    missing_messages: IndexSet<LazyPush<PA>>,
+    // missing_messages: IndexSet<MissingMessage<PA>>,
+    missing_messages: HashMap<MessageId, VecDeque<(PA, Round)>>,
     received_messages: IndexSet<MessageId>,
     cache: HashMap<MessageId, Gossip>,
 
-    timers: HashSet<MessageId>,
+    graft_timer_scheduled: HashSet<MessageId>,
     dispatch_timer_scheduled: bool,
 }
 
@@ -171,7 +174,7 @@ impl<PA: PeerAddress> State<PA> {
             config,
             missing_messages: Default::default(),
             received_messages: Default::default(),
-            timers: Default::default(),
+            graft_timer_scheduled: Default::default(),
             cache: Default::default(),
             dispatch_timer_scheduled: false,
         }
@@ -222,27 +225,43 @@ impl<PA: PeerAddress> State<PA> {
             round: Round(0),
             content: data,
         };
-        let me = self.me.clone();
+        self.received_messages.insert(id);
+        self.cache.insert(id, message.clone());
+        let me = self.me;
         self.eager_push(message.clone(), &me, io);
         self.lazy_push(message.clone(), &me, io);
-        self.received_messages.insert(id);
-        self.cache.insert(id, message);
     }
 
     fn on_gossip(&mut self, sender: PA, message: Gossip, io: &mut impl IO<PA>) {
+        // if we already received this message: move peer to lazy set
+        // and notify peer about this.
         if self.received_messages.contains(&message.id) {
             self.add_lazy(sender.clone());
             io.push(OutEvent::SendMessage(sender, Message::Prune));
+        // otherwise store the message, emit to application and forward to peers
         } else {
+            // cleanup places where we track missing messages
+            self.missing_messages.remove(&message.id);
+            self.graft_timer_scheduled.remove(&message.id);
+
+            // insert the message in the list of received messages
             self.received_messages.insert(message.id);
-            let forward = Gossip {
-                id: message.id,
-                content: message.content.clone(),
-                round: message.round.next(),
-            };
-            self.eager_push(forward.clone(), &sender, io);
-            self.lazy_push(forward, &sender, io);
+
+            // increase the round for forwarding the message, and add to cache
+            // to reply to Graft messages later
+            // TODO: use an LRU cache for self.cache
+            // TODO: add callback/event to application to get missing messages that were received before?
+            let message = message.next_round();
+            self.cache.insert(message.id, message.clone());
+
+            // push the message to our peers
+            self.eager_push(message.clone(), &sender, io);
+            self.lazy_push(message.clone(), &sender, io);
+
+            // emit event to application
             io.push(OutEvent::EmitEvent(Event::Received(message.content)));
+
+            // TODO: optimize (optional)
         }
     }
 
@@ -250,60 +269,75 @@ impl<PA: PeerAddress> State<PA> {
         self.add_lazy(sender);
     }
 
+    // "When a node receives a IHAVE message, it simply marks the corresponding message as missing
+    // It then starts a timer, with a predefined timeout value, and waits for the missing message to be
+    // received via eager push before the timer expires. The timeout value is a protocol parameter
+    // that should be configured considering the diameter of the overlay and a target maximum recovery latency, defined
+    // by the application requirements. This is a parameter that should be statically configured at deployment time." (p8)
     fn on_ihave(&mut self, sender: PA, ihaves: Vec<IHave>, io: &mut impl IO<PA>) {
         for ihave in ihaves {
-            if self.received_messages.contains(&ihave.id) {
-                let record = LazyPush {
-                    id: ihave.id,
-                    round: ihave.round,
-                    peer: sender.clone(),
-                };
-                self.missing_messages.insert(record);
-                self.timers.insert(ihave.id);
-                io.push(OutEvent::ScheduleTimer(
-                    self.config.ihave_timeout,
-                    Timer::SendGraft(ihave.id),
-                ));
+            if !self.received_messages.contains(&ihave.id) {
+                self.missing_messages
+                    .entry(ihave.id)
+                    .or_default()
+                    .push_back((sender, ihave.round));
+
+                if !self.graft_timer_scheduled.contains(&ihave.id) {
+                    self.graft_timer_scheduled.insert(ihave.id);
+                    io.push(OutEvent::ScheduleTimer(
+                        self.config.graft_timeout_1,
+                        Timer::SendGraft(ihave.id),
+                    ));
+                }
             }
         }
     }
 
     fn on_send_graft_timer(&mut self, id: MessageId, io: &mut impl IO<PA>) {
-        if !self.timers.contains(&id) {
-            self.timers.insert(id);
+        if self.received_messages.contains(&id) {
+            return;
+        }
+        let entry = self
+            .missing_messages
+            .get_mut(&id)
+            .and_then(|entries| entries.pop_front());
+        if let Some((peer, round)) = entry {
+            self.add_eager(peer);
+            let message = Message::Graft(Graft { id, round });
+            io.push(OutEvent::SendMessage(peer, message));
+
+            // "when a GRAFT message is sent, another timer is started to expire after a certain timeout,
+            // to ensure that the message will be requested to another neighbor if it is not received
+            // meanwhile. This second timeout value should be smaller that the first, in the order of
+            // an average round trip time to a neighbor." (p9)
             io.push(OutEvent::ScheduleTimer(
-                self.config.graft_timeout,
+                self.config.graft_timeout_2,
                 Timer::SendGraft(id),
             ));
-        }
-        if let Some(entry) = remove_first_match(&mut self.missing_messages, |x| x.id == id) {
-            self.add_eager(entry.peer.clone());
-            let message = Message::Graft(Graft {
-                id,
-                round: entry.round,
-            });
-            io.push(OutEvent::SendMessage(entry.peer, message));
         }
     }
 
     fn on_graft(&mut self, sender: PA, details: Graft, io: &mut impl IO<PA>) {
-        self.add_eager(sender.clone());
-        if self.received_messages.contains(&details.id) {
-            if let Some(message) = self.cache.get(&details.id) {
-                io.push(OutEvent::SendMessage(
-                    sender,
-                    Message::Gossip(message.clone()),
-                ));
-            }
+        self.add_eager(sender);
+        if let Some(message) = self.cache.get(&details.id) {
+            io.push(OutEvent::SendMessage(
+                sender,
+                Message::Gossip(message.clone()),
+            ));
         }
     }
 
     fn on_neighbor_up(&mut self, peer: PA) {
-        self.eager_push_peers.insert(peer);
+        self.add_eager(peer);
     }
 
+    // "When a neighbor is detected to leave the overlay, it is simple removed from the membership.
+    // Furthermore, the record of IHAVE messages sent from failed members is deleted from the missing history" (p9)
     fn on_neighbor_down(&mut self, peer: PA) {
-        self.missing_messages.retain(|keep| keep.peer != peer);
+        self.missing_messages.retain(|_message_id, ihaves| {
+            ihaves.retain(|(ihave_peer, _round)| *ihave_peer != peer);
+            !ihaves.is_empty()
+        });
         self.eager_push_peers.remove(&peer);
         self.lazy_push_peers.remove(&peer);
     }
@@ -350,17 +384,5 @@ impl<PA: PeerAddress> State<PA> {
             ));
             self.dispatch_timer_scheduled = true;
         }
-    }
-}
-
-fn remove_first_match<T: Eq + Hash + Clone>(
-    set: &mut IndexSet<T>,
-    find: impl Fn(&T) -> bool,
-) -> Option<T> {
-    let found = set.iter().enumerate().find(|(_idx, value)| find(value));
-    if let Some((index, _found)) = found {
-        set.shift_remove_index(index)
-    } else {
-        None
     }
 }
