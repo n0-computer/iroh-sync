@@ -7,19 +7,32 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
+    fmt::{Debug, Display},
+    str::FromStr,
+    sync::Arc,
     time::SystemTime,
 };
 
-use blake3::Hash;
+use parking_lot::RwLock;
+
+use bytes::Bytes;
 use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, VerifyingKey};
+use iroh::Hash;
 use rand_core::CryptoRngCore;
+use serde::{Deserialize, Serialize};
 
 use crate::ranger::{AsFingerprint, Fingerprint, Peer, Range, RangeKey};
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Author {
     priv_key: SigningKey,
     id: AuthorId,
+}
+
+impl Display for Author {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Author({})", hex::encode(self.priv_key.to_bytes()))
+    }
 }
 
 impl Author {
@@ -43,8 +56,14 @@ impl Author {
     }
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorId(VerifyingKey);
+
+impl Debug for AuthorId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AuthorId({})", hex::encode(self.0.as_bytes()))
+    }
+}
 
 impl AuthorId {
     pub fn verify(&self, msg: &[u8], signature: &Signature) -> Result<(), SignatureError> {
@@ -56,10 +75,38 @@ impl AuthorId {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Namespace {
     priv_key: SigningKey,
     id: NamespaceId,
+}
+
+impl Display for Namespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Namespace({})", hex::encode(self.priv_key.to_bytes()))
+    }
+}
+
+impl FromStr for Namespace {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let priv_key: [u8; 32] = hex::decode(s).map_err(|_| ())?.try_into().map_err(|_| ())?;
+        let priv_key = SigningKey::from_bytes(&priv_key);
+        let id = NamespaceId(priv_key.verifying_key());
+        Ok(Namespace { priv_key, id })
+    }
+}
+
+impl FromStr for Author {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let priv_key: [u8; 32] = hex::decode(s).map_err(|_| ())?.try_into().map_err(|_| ())?;
+        let priv_key = SigningKey::from_bytes(&priv_key);
+        let id = AuthorId(priv_key.verifying_key());
+        Ok(Author { priv_key, id })
+    }
 }
 
 impl Namespace {
@@ -83,8 +130,20 @@ impl Namespace {
     }
 }
 
-#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamespaceId(VerifyingKey);
+
+impl Display for NamespaceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NamespaceId({})", hex::encode(self.0.as_bytes()))
+    }
+}
+
+impl Debug for NamespaceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NamespaceId({})", hex::encode(self.0.as_bytes()))
+    }
+}
 
 impl NamespaceId {
     pub fn verify(&self, msg: &[u8], signature: &Signature) -> Result<(), SignatureError> {
@@ -96,11 +155,16 @@ impl NamespaceId {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Replica {
+    inner: Arc<RwLock<InnerReplica>>,
+}
+
+#[derive(Debug)]
+struct InnerReplica {
     namespace: Namespace,
     peer: Peer<RecordIdentifier, SignedEntry, Store>,
-    content: HashMap<Hash, Vec<u8>>,
+    content: HashMap<Hash, Bytes>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -230,35 +294,52 @@ impl<'a> Iterator for RangeIterator<'a> {
 impl Replica {
     pub fn new(namespace: Namespace) -> Self {
         Replica {
-            namespace,
-            peer: Peer::default(),
-            content: HashMap::default(),
+            inner: Arc::new(RwLock::new(InnerReplica {
+                namespace,
+                peer: Peer::default(),
+                content: HashMap::default(),
+            })),
         }
     }
 
-    pub fn get_content(&self, hash: &Hash) -> Option<&[u8]> {
-        self.content.get(hash).map(|v| v.as_ref())
+    pub fn get_content(&self, hash: &Hash) -> Option<Bytes> {
+        self.inner.read().content.get(hash).cloned()
+    }
+
+    // TODO: not horrible
+    pub fn all(&self) -> Vec<(RecordIdentifier, SignedEntry)> {
+        self.inner
+            .read()
+            .peer
+            .all()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Inserts a new record at the given key.
-    pub fn insert(&mut self, key: impl AsRef<[u8]>, author: &Author, data: impl AsRef<[u8]>) {
-        let id = RecordIdentifier::new(key, self.namespace.id(), author.id());
-        let record = Record::from_data(data.as_ref(), self.namespace.id());
+    pub fn insert(&self, key: impl AsRef<[u8]>, author: &Author, data: impl Into<Bytes>) {
+        let mut inner = self.inner.write();
+
+        let id = RecordIdentifier::new(key, inner.namespace.id(), author.id());
+        let data: Bytes = data.into();
+        let record = Record::from_data(&data, inner.namespace.id());
 
         // Store content
-        self.content
-            .insert(*record.content_hash(), data.as_ref().to_vec());
+        inner.content.insert(*record.content_hash(), data);
 
         // Store signed entries
         let entry = Entry::new(id.clone(), record);
-        let signed_entry = entry.sign(&self.namespace, author);
-        self.peer.put(id, signed_entry);
+        let signed_entry = entry.sign(&inner.namespace, author);
+        inner.peer.put(id, signed_entry);
     }
 
     /// Gets all entries matching this key and author.
-    pub fn get_latest(&self, key: impl AsRef<[u8]>, author: &AuthorId) -> Option<&SignedEntry> {
-        self.peer
-            .get(&RecordIdentifier::new(key, &self.namespace.id(), author))
+    pub fn get_latest(&self, key: impl AsRef<[u8]>, author: &AuthorId) -> Option<SignedEntry> {
+        let inner = self.inner.read();
+        inner
+            .peer
+            .get(&RecordIdentifier::new(key, &inner.namespace.id(), author))
+            .cloned()
     }
 
     /// Returns all versions of the matching documents.
@@ -266,41 +347,60 @@ impl Replica {
         &'a self,
         key: impl AsRef<[u8]> + 'b,
         author: &AuthorId,
-    ) -> impl Iterator<Item = &SignedEntry> + 'a {
-        let author = *author;
-        self.peer
-            .store()
-            .records
-            .iter()
-            .filter(move |(k, _)| {
-                k.key == key.as_ref() && &k.namespace == self.namespace.id() && k.author == author
-            })
-            .flat_map(|(_, v)| v.values())
+    ) -> GetAllIter<'a> {
+        let guard: parking_lot::lock_api::RwLockReadGuard<_, _> = self.inner.read();
+        let record_id = RecordIdentifier::new(key, guard.namespace.id(), author);
+        GetAllIter {
+            records: parking_lot::lock_api::RwLockReadGuard::map(guard, move |inner| {
+                &inner.peer.store().records
+            }),
+            record_id,
+            index: 0,
+        }
     }
 
-    pub fn peer_mut(&mut self) -> &mut Peer<RecordIdentifier, SignedEntry, Store> {
-        &mut self.peer
+    pub fn sync_initial_message(&self) -> crate::ranger::Message<RecordIdentifier, SignedEntry> {
+        self.inner.read().peer.initial_message()
     }
 
-    /// Removes any content that was synced, that does not contain
-    /// valid signatures.
-    pub fn verify_store(&mut self) {
-        // TODO: this should probably happen during the sync.
-        let mut to_remove = Vec::new();
-        for (k, v) in self.peer.all() {
-            if v.verify().is_err() {
-                to_remove.push(k.clone());
-            }
-        }
+    pub fn sync_process_message(
+        &self,
+        message: crate::ranger::Message<RecordIdentifier, SignedEntry>,
+    ) -> Option<crate::ranger::Message<RecordIdentifier, SignedEntry>> {
+        self.inner.write().peer.process_message(message)
+    }
 
-        for k in to_remove {
-            self.peer.remove(&k);
-        }
+    pub fn namespace(&self) -> NamespaceId {
+        *self.inner.read().namespace.id()
+    }
+}
+
+pub struct GetAllIter<'a> {
+    // Oh my god, rust why u do this to me?
+    records: parking_lot::lock_api::MappedRwLockReadGuard<
+        'a,
+        parking_lot::RawRwLock,
+        BTreeMap<RecordIdentifier, BTreeMap<u64, SignedEntry>>,
+    >,
+    record_id: RecordIdentifier,
+    /// Current iteration index.
+    index: usize,
+}
+
+impl<'a> Iterator for GetAllIter<'a> {
+    type Item = SignedEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let values = self.records.get(&self.record_id)?;
+
+        let (_, res) = values.iter().nth(self.index)?;
+        self.index += 1;
+        Some(res.clone()) // :( I give up
     }
 }
 
 /// A signed entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedEntry {
     signature: EntrySignature,
     entry: Entry,
@@ -327,7 +427,7 @@ impl SignedEntry {
 }
 
 /// Signature over an entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntrySignature {
     author_signature: Signature,
     namespace_signature: Signature,
@@ -362,7 +462,7 @@ impl EntrySignature {
 }
 
 /// A single entry in a replica.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     id: RecordIdentifier,
     record: Record,
@@ -399,7 +499,7 @@ impl Entry {
 }
 
 /// The indentifier of a record.
-#[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RecordIdentifier {
     /// The key of the record.
     key: Vec<u8>,
@@ -486,7 +586,7 @@ impl RecordIdentifier {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     /// Record creation timestamp. Counted as micros since the Unix epoch.
     timestamp: u64,
@@ -531,13 +631,13 @@ impl Record {
         hasher.update(data);
         let hash = hasher.finalize();
 
-        Self::new(timestamp, len, hash)
+        Self::new(timestamp, len, hash.into())
     }
 
     pub fn as_bytes(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.timestamp.to_be_bytes());
         out.extend_from_slice(&self.len.to_be_bytes());
-        out.extend_from_slice(self.hash.as_bytes());
+        out.extend_from_slice(self.hash.as_ref());
     }
 }
 
@@ -557,7 +657,7 @@ mod tests {
         let signed_entry = entry.sign(&myspace, &alice);
         signed_entry.verify().expect("failed to verify");
 
-        let mut my_replica = Replica::new(myspace);
+        let my_replica = Replica::new(myspace);
         for i in 0..10 {
             my_replica.insert(format!("/{i}"), &alice, format!("{i}: hello from alice"));
         }
@@ -575,7 +675,7 @@ mod tests {
         let content = my_replica
             .get_content(entry.entry().record().content_hash())
             .unwrap();
-        assert_eq!(content, b"round 1");
+        assert_eq!(&content[..], b"round 1");
 
         // Second
 
@@ -584,7 +684,7 @@ mod tests {
         let content = my_replica
             .get_content(entry.entry().record().content_hash())
             .unwrap();
-        assert_eq!(content, b"round 2");
+        assert_eq!(&content[..], b"round 2");
 
         // Get All
         let entries: Vec<_> = my_replica.get_all("/cool/path", alice.id()).collect();
@@ -592,11 +692,11 @@ mod tests {
         let content = my_replica
             .get_content(entries[0].entry().record().content_hash())
             .unwrap();
-        assert_eq!(content, b"round 1");
+        assert_eq!(&content[..], b"round 1");
         let content = my_replica
             .get_content(entries[1].entry().record().content_hash())
             .unwrap();
-        assert_eq!(content, b"round 2");
+        assert_eq!(&content[..], b"round 2");
     }
 
     #[test]
@@ -609,12 +709,12 @@ mod tests {
         let myspace = Namespace::new(&mut rng);
         let mut alice = Replica::new(myspace.clone());
         for el in &alice_set {
-            alice.insert(el, &author, el);
+            alice.insert(el, &author, el.as_bytes());
         }
 
         let mut bob = Replica::new(myspace);
         for el in &bob_set {
-            bob.insert(el, &author, el);
+            bob.insert(el, &author, el.as_bytes());
         }
 
         sync(&author, &mut alice, &mut bob, &alice_set, &bob_set);
@@ -628,19 +728,15 @@ mod tests {
         bob_set: &[&str],
     ) {
         // Sync alice - bob
-        let mut next_to_bob = Some(alice.peer_mut().initial_message());
+        let mut next_to_bob = Some(alice.sync_initial_message());
         let mut rounds = 0;
         while let Some(msg) = next_to_bob.take() {
             assert!(rounds < 100, "too many rounds");
             rounds += 1;
-            if let Some(msg) = bob.peer_mut().process_message(msg) {
-                next_to_bob = alice.peer_mut().process_message(msg);
+            if let Some(msg) = bob.sync_process_message(msg) {
+                next_to_bob = alice.sync_process_message(msg);
             }
         }
-
-        // check signatures
-        alice.verify_store();
-        bob.verify_store();
 
         // Check result
         for el in alice_set {

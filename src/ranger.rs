@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
+use serde::{Deserialize, Serialize};
+
 /// Stores a range.
 ///
 /// There are three possibilities
@@ -14,7 +16,7 @@ use std::marker::PhantomData;
 /// - [x, y): x < y: Includes x, but not y
 /// - S \ [y, x) y < x: Includes x, but not y.
 /// This means that ranges are "wrap around" conceptually.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub struct Range<K> {
     x: K,
     y: K,
@@ -64,7 +66,7 @@ pub fn contains<T: Ord>(t: &T, range: &Range<T>) -> bool {
 impl RangeKey for &str {}
 impl RangeKey for &[u8] {}
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fingerprint(pub [u8; 32]);
 
 impl Debug for Fingerprint {
@@ -102,27 +104,47 @@ impl std::ops::BitXorAssign for Fingerprint {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RangeFingerprint<K> {
+    #[serde(bound(
+        serialize = "Range<K>: Serialize",
+        deserialize = "Range<K>: Deserialize<'de>"
+    ))]
     pub range: Range<K>,
     /// The fingerprint of `range`.
     pub fingerprint: Fingerprint,
 }
 
 /// Transfers items inside a range to the other participant.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RangeItem<K, V> {
     /// The range out of which the elements are.
+    #[serde(bound(
+        serialize = "Range<K>: Serialize",
+        deserialize = "Range<K>: Deserialize<'de>"
+    ))]
     pub range: Range<K>,
+    #[serde(bound(
+        serialize = "K: Serialize, V: Serialize",
+        deserialize = "K: Deserialize<'de>, V: Deserialize<'de>"
+    ))]
     pub values: Vec<(K, V)>,
     /// If false, requests to send local items in the range.
     /// Otherwise not.
     pub have_local: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MessagePart<K, V> {
+    #[serde(bound(
+        serialize = "RangeFingerprint<K>: Serialize",
+        deserialize = "RangeFingerprint<K>: Deserialize<'de>"
+    ))]
     RangeFingerprint(RangeFingerprint<K>),
+    #[serde(bound(
+        serialize = "RangeItem<K, V>: Serialize",
+        deserialize = "RangeItem<K, V>: Deserialize<'de>"
+    ))]
     RangeItem(RangeItem<K, V>),
 }
 
@@ -143,8 +165,12 @@ impl<K, V> MessagePart<K, V> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message<K, V> {
+    #[serde(bound(
+        serialize = "MessagePart<K, V>: Serialize",
+        deserialize = "MessagePart<K, V>: Deserialize<'de>"
+    ))]
     parts: Vec<MessagePart<K, V>>,
 }
 

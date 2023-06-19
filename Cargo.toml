@@ -9,6 +9,7 @@ authors = ["n0 team"]
 repository = "https://github.com/n0-computer/iroh-sync"
 
 [dependencies]
+anyhow = "1.0.71"
 blake3 = "1.3.3"
 crossbeam = "0.8.2"
 ed25519-dalek = { version = "2.0.0-rc.2", features = ["serde", "rand_core"] }
@@ -17,6 +18,14 @@ rand = "0.8.5"
 rand_core = "0.6.4"
 serde = { version = "1.0.164", features = ["derive"] }
 url = "2.4.0"
+iroh = { version = "0.4", git = "https://github.com/n0-computer/iroh", branch = "main" }
+bytes = "1.4.0"
+parking_lot = "0.12.1"
+hex = "0.4"
 
 [dev-dependencies]
-hex = "0.4.3"
+tokio = { version = "1.28.2", features = ["sync", "macros"] }
+
+[patch.crates-io.ed25519-dalek]
+git = "https://github.com/dalek-cryptography/ed25519-dalek"
+rev = "4afbf09e1cb15bedc6f79c25cec388b5cd436f0d"
