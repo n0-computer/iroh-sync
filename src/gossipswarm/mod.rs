@@ -419,7 +419,7 @@ mod test {
         ) {
             eprintln!("round {:?}", message[0]);
             let mut expected: HashSet<usize> =
-                HashSet::from_iter(network.peers.keys().filter(|p| **p != from).cloned());
+                HashSet::from_iter(network.peers.iter().map(|p| *p.endpoint()));
             let message: Bytes = message.into();
             network.command(from, Command::Broadcast(message.clone()));
             for i in 0..max_ticks {
@@ -429,9 +429,9 @@ mod test {
                 network.tick();
                 let events = network.events();
                 let received: HashSet<_> = events
-                    .filter(|(_peer, event)| matches!(event,  Event::Received(recv) if recv == &message))
-                    .map(|(peer, _msg)| peer)
-                    .collect();
+                .filter(|(_peer, event)| matches!(event,  Event::Received(recv) if recv == &message))
+                .map(|(peer, _msg)| peer)
+                .collect();
                 for peer in received.iter() {
                     expected.remove(peer);
                 }
@@ -454,7 +454,7 @@ mod test {
         let mut passive_distrib: BTreeMap<usize, usize> = BTreeMap::new();
         let mut payload_recv = 0;
         let mut control_recv = 0;
-        for (_peer, state) in network.peers.iter() {
+        for state in network.peers.iter() {
             let stats = state.gossip.stats();
             *eager_distrib
                 .entry(state.gossip.eager_push_peers.len())
@@ -491,12 +491,13 @@ mod test {
         start: Instant,
         time: Instant,
         tick_duration: Duration,
-        inqueues: HashMap<PA, VecDeque<InEvent<PA>>>,
-        peers: HashMap<PA, State<PA>>,
+        inqueues: Vec<VecDeque<InEvent<PA>>>,
+        peers: Vec<State<PA>>,
+        peers_by_address: HashMap<PA, usize>,
         conns: HashSet<ConnId<PA>>,
         events: VecDeque<(PA, Event<PA>)>,
-        timers: TimerMap<(PA, Timer<PA>)>,
-        transport: TimerMap<(PA, InEvent<PA>)>,
+        timers: TimerMap<(usize, Timer<PA>)>,
+        transport: TimerMap<(usize, InEvent<PA>)>,
         latencies: HashMap<ConnId<PA>, Duration>,
     }
     impl<PA> Network<PA> {
@@ -507,6 +508,7 @@ mod test {
                 tick_duration: TICK_DURATION,
                 inqueues: Default::default(),
                 peers: Default::default(),
+                peers_by_address: Default::default(),
                 conns: Default::default(),
                 events: Default::default(),
                 timers: TimerMap::new(),
@@ -517,17 +519,19 @@ mod test {
     }
 
     fn push_back<PA: Eq + std::hash::Hash>(
-        inqueues: &mut HashMap<PA, VecDeque<InEvent<PA>>>,
-        peer: &PA,
+        inqueues: &mut Vec<VecDeque<InEvent<PA>>>,
+        peer_pos: usize,
         event: InEvent<PA>,
     ) {
-        inqueues.get_mut(peer).unwrap().push_back(event);
+        inqueues.get_mut(peer_pos).unwrap().push_back(event);
     }
 
     impl<PA: PeerAddress + Ord> Network<PA> {
         pub fn push(&mut self, peer: State<PA>) {
-            self.inqueues.insert(*peer.endpoint(), VecDeque::new());
-            self.peers.insert(*peer.endpoint(), peer);
+            let idx = self.inqueues.len();
+            self.inqueues.push(VecDeque::new());
+            self.peers_by_address.insert(*peer.endpoint(), idx);
+            self.peers.push(peer);
         }
 
         pub fn events(&mut self) -> impl Iterator<Item = (PA, Event<PA>)> + '_ {
@@ -544,7 +548,8 @@ mod test {
 
         pub fn command(&mut self, peer: PA, command: Command<PA>) {
             debug!(?peer, "~~ COMMAND {command:?}");
-            push_back(&mut self.inqueues, &peer, InEvent::Command(command));
+            let idx = *self.peers_by_address.get(&peer).unwrap();
+            push_back(&mut self.inqueues, idx, InEvent::Command(command));
         }
 
         pub fn ticks(&mut self, n: usize) {
@@ -559,20 +564,20 @@ mod test {
             self.time += self.tick_duration;
 
             // process timers
-            for (_time, (peer, timer)) in self.timers.drain_until(&self.time) {
-                push_back(&mut self.inqueues, &peer, InEvent::TimerExpired(timer));
+            for (_time, (idx, timer)) in self.timers.drain_until(&self.time) {
+                push_back(&mut self.inqueues, idx, InEvent::TimerExpired(timer));
             }
 
             // move messages
             for (_time, (peer, event)) in self.transport.drain_until(&self.time) {
-                push_back(&mut self.inqueues, &peer, event);
+                push_back(&mut self.inqueues, peer, event);
             }
 
             // process inqueues: let peer handle all incoming events
             let mut messages_sent = 0;
-            for (peer, queue) in self.inqueues.iter_mut() {
-                let peer = *peer;
-                let state = self.peers.get_mut(&peer).unwrap();
+            for (idx, queue) in self.inqueues.iter_mut().enumerate() {
+                let state = self.peers.get_mut(idx).unwrap();
+                let peer = *state.endpoint();
                 while let Some(event) = queue.pop_front() {
                     match &event {
                         InEvent::RecvMessage(from, _mesage) => {
@@ -586,24 +591,26 @@ mod test {
                         debug!(peer = ?peer, "OUT {event:?}");
                         match event {
                             OutEvent::SendMessage(to, message) => {
+                                let to_idx = *self.peers_by_address.get(&to).unwrap();
                                 let latency = latency_between(&mut self.latencies, &peer, &to);
                                 self.transport.insert(
                                     self.time + latency,
-                                    (to, InEvent::RecvMessage(peer, message)),
+                                    (to_idx, InEvent::RecvMessage(peer, message)),
                                 );
                                 messages_sent += 1;
                             }
                             OutEvent::ScheduleTimer(latency, timer) => {
-                                self.timers.insert(self.time + latency, (peer, timer));
+                                self.timers.insert(self.time + latency, (idx, timer));
                             }
                             OutEvent::DisconnectPeer(to) => {
                                 debug!(peer = ?peer, other = ?to, "disconnect");
+                                let to_idx = *self.peers_by_address.get(&to).unwrap();
                                 let latency = latency_between(&mut self.latencies, &peer, &to)
                                     + Duration::from_nanos(1);
                                 if self.conns.remove(&(peer, to).into()) {
                                     self.transport.insert(
                                         self.time + latency,
-                                        (to, InEvent::PeerDisconnected(peer)),
+                                        (to_idx, InEvent::PeerDisconnected(peer)),
                                     );
                                 }
                             }
@@ -621,7 +628,6 @@ mod test {
             );
         }
     }
-
     fn latency_between<PA: PeerAddress>(
         _latencies: &mut HashMap<ConnId<PA>, Duration>,
         _a: &PA,
@@ -631,17 +637,25 @@ mod test {
     }
 
     fn assert_synchronous_active<PA: PeerAddress>(network: &Network<PA>) -> bool {
-        for (peer, state) in network.peers.iter() {
+        for state in network.peers.iter() {
+            let peer = *state.endpoint();
             for other in state.swarm.active_view.iter() {
-                let other_state = &network.peers.get(other).unwrap().swarm.active_view;
-                if !other_state.contains(peer) {
+                let other_idx = network.peers_by_address.get(other).unwrap();
+                let other_state = &network.peers.get(*other_idx).unwrap().swarm.active_view;
+                if !other_state.contains(&peer) {
                     warn!(peer = ?peer, other = ?other, "missing active_view peer in other");
                     return false;
                 }
             }
             for other in state.gossip.eager_push_peers.iter() {
-                let other_state = &network.peers.get(other).unwrap().gossip.eager_push_peers;
-                if !other_state.contains(peer) {
+                let other_idx = network.peers_by_address.get(other).unwrap();
+                let other_state = &network
+                    .peers
+                    .get(*other_idx)
+                    .unwrap()
+                    .gossip
+                    .eager_push_peers;
+                if !other_state.contains(&peer) {
                     warn!(peer = ?peer, other = ?other, "missing eager_push peer in other");
                     return false;
                 }
