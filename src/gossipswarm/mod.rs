@@ -1,4 +1,9 @@
-use std::{collections::VecDeque, fmt, hash::Hash, time::Duration};
+use std::{
+    collections::VecDeque,
+    fmt,
+    hash::Hash,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use derive_more::From;
@@ -11,8 +16,9 @@ mod util;
 use hyparview::InEvent as SwarmIn;
 use plumtree::InEvent as GossipIn;
 
-pub trait PeerAddress: Hash + Eq + Copy + fmt::Debug + Serialize + DeserializeOwned {}
-impl<T> PeerAddress for T where T: Hash + Eq + Copy + fmt::Debug + Serialize + DeserializeOwned {}
+pub trait PeerAddress: Hash + Eq + Copy + fmt::Debug + Ord + Serialize + DeserializeOwned {}
+impl<T> PeerAddress for T where T: Hash + Eq + Copy + fmt::Debug + Ord + Serialize + DeserializeOwned
+{}
 
 /// Input event to the state handler.
 #[derive(Debug)]
@@ -22,7 +28,7 @@ pub enum InEvent<PA> {
     /// Execute a command from the application.
     Command(Command<PA>),
     /// Trigger a previously scheduled timer.
-    TimerExpired(Timer),
+    TimerExpired(Timer<PA>),
     /// Peer disconnected on the network level.
     PeerDisconnected(PA),
 }
@@ -36,7 +42,7 @@ pub enum OutEvent<PA> {
     EmitEvent(Event<PA>),
     /// Schedule a timer. The runtime is responsible for sending an [InEvent::TimerExpired]
     /// after the duration.
-    ScheduleTimer(Duration, Timer),
+    ScheduleTimer(Duration, Timer<PA>),
     /// Close the connection to a peer on the network level.
     DisconnectPeer(PA),
 }
@@ -99,8 +105,8 @@ impl<PA> From<plumtree::Event> for Event<PA> {
 }
 
 #[derive(From, Debug)]
-pub enum Timer {
-    Swarm(hyparview::Timer),
+pub enum Timer<PA> {
+    Swarm(hyparview::Timer<PA>),
     Gossip(plumtree::Timer),
 }
 
@@ -130,6 +136,7 @@ pub struct State<PA> {
     swarm: hyparview::State<PA, rand::rngs::OsRng>,
     gossip: plumtree::State<PA>,
     outbox: VecDeque<OutEvent<PA>>,
+    stats: Stats,
 }
 
 impl<PA: PeerAddress> State<PA> {
@@ -140,6 +147,7 @@ impl<PA: PeerAddress> State<PA> {
             gossip: plumtree::State::new(me.clone(), config.broadcast),
             me,
             outbox: VecDeque::new(),
+            stats: Stats::default(),
         }
     }
 
@@ -152,28 +160,37 @@ impl<PA: PeerAddress> State<PA> {
     ///
     /// Returns an iterator of outgoing events that must be processed by the application.
     #[must_use]
-    pub fn handle<'a>(&'a mut self, event: InEvent<PA>) -> impl Iterator<Item = OutEvent<PA>> + 'a {
+    pub fn handle<'a>(
+        &'a mut self,
+        event: InEvent<PA>,
+        now: Instant,
+    ) -> impl Iterator<Item = OutEvent<PA>> + 'a {
         let io = &mut self.outbox;
         // Process the event, store out events in outbox.
         match event {
             InEvent::Command(command) => match command {
-                Command::Join(peer) => self.swarm.handle(SwarmIn::RequestJoin(peer), io),
+                Command::Join(peer) => self.swarm.handle(SwarmIn::RequestJoin(peer), now, io),
                 Command::Broadcast(data) => self.gossip.handle(GossipIn::Broadcast(data), io),
             },
-            InEvent::RecvMessage(from, message) => match message {
-                Message::Swarm(message) => {
-                    self.swarm.handle(SwarmIn::RecvMessage(from, message), io)
+            InEvent::RecvMessage(from, message) => {
+                self.stats.messages_received += 1;
+                match message {
+                    Message::Swarm(message) => {
+                        self.swarm
+                            .handle(SwarmIn::RecvMessage(from, message), now, io)
+                    }
+                    Message::Gossip(message) => {
+                        self.gossip.handle(GossipIn::RecvMessage(from, message), io)
+                    }
                 }
-                Message::Gossip(message) => {
-                    self.gossip.handle(GossipIn::RecvMessage(from, message), io)
-                }
-            },
+            }
             InEvent::TimerExpired(timer) => match timer {
-                Timer::Swarm(timer) => self.swarm.handle(SwarmIn::TimerExpired(timer), io),
+                Timer::Swarm(timer) => self.swarm.handle(SwarmIn::TimerExpired(timer), now, io),
                 Timer::Gossip(timer) => self.gossip.handle(GossipIn::TimerExpired(timer), io),
             },
             InEvent::PeerDisconnected(peer) => {
-                self.swarm.handle(SwarmIn::PeerDisconnected(peer), io)
+                self.swarm.handle(SwarmIn::PeerDisconnected(peer), now, io);
+                self.gossip.handle(GossipIn::PeerDisconnected(peer), io);
             }
         }
 
@@ -194,8 +211,25 @@ impl<PA: PeerAddress> State<PA> {
         // above does not emit any OutEvents.
         self.outbox.extend(io.drain(..));
 
+        // Update sent message counter
+        self.stats.messages_sent += self
+            .outbox
+            .iter()
+            .filter(|event| matches!(event, OutEvent::SendMessage(_, _)))
+            .count();
+
         self.outbox.drain(..)
     }
+
+    pub fn stats(&self) -> &Stats {
+        &self.stats
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Stats {
+    pub messages_sent: usize,
+    pub messages_received: usize,
 }
 
 #[cfg(test)]

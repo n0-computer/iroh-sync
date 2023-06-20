@@ -36,7 +36,7 @@ where
         self.inner.insert(value)
     }
 
-    pub fn contains(&mut self, value: &T) -> bool {
+    pub fn contains(&self, value: &T) -> bool {
         self.inner.contains(value)
     }
 

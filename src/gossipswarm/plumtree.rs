@@ -26,6 +26,7 @@ pub enum InEvent<PA> {
     TimerExpired(Timer),
     NeighborUp(PA),
     NeighborDown(PA),
+    PeerDisconnected(PA),
 }
 
 pub enum OutEvent<PA> {
@@ -145,23 +146,30 @@ impl Default for Config {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct Stats {
+    pub payload_messages_received: u16,
+    pub control_messages_received: u16,
+}
+
 #[derive(Debug)]
 pub struct State<PA> {
     me: PA,
     config: Config,
 
-    eager_push_peers: HashSet<PA>,
-    lazy_push_peers: HashSet<PA>,
+    pub(crate) eager_push_peers: HashSet<PA>,
+    pub(crate) lazy_push_peers: HashSet<PA>,
 
     lazy_push_queue: HashMap<PA, Vec<IHave>>,
 
-    // missing_messages: IndexSet<MissingMessage<PA>>,
     missing_messages: HashMap<MessageId, VecDeque<(PA, Round)>>,
     received_messages: IndexSet<MessageId>,
     cache: HashMap<MessageId, Gossip>,
 
     graft_timer_scheduled: HashSet<MessageId>,
     dispatch_timer_scheduled: bool,
+
+    stats: Stats,
 }
 
 impl<PA: PeerAddress> State<PA> {
@@ -177,6 +185,7 @@ impl<PA: PeerAddress> State<PA> {
             graft_timer_scheduled: Default::default(),
             cache: Default::default(),
             dispatch_timer_scheduled: false,
+            stats: Default::default(),
         }
     }
 
@@ -188,6 +197,7 @@ impl<PA: PeerAddress> State<PA> {
             InEvent::Broadcast(data) => self.do_broadcast(data, io),
             InEvent::NeighborUp(peer) => self.on_neighbor_up(peer),
             InEvent::NeighborDown(peer) => self.on_neighbor_down(peer),
+            InEvent::PeerDisconnected(peer) => self.on_neighbor_down(peer),
             InEvent::TimerExpired(timer) => match timer {
                 Timer::DispatchLazyPush => self.on_dispatch_timer(io),
                 Timer::SendGraft(id) => {
@@ -197,7 +207,16 @@ impl<PA: PeerAddress> State<PA> {
         }
     }
 
+    pub fn stats(&self) -> &Stats {
+        &self.stats
+    }
+
     fn handle_message(&mut self, sender: PA, message: Message, io: &mut impl IO<PA>) {
+        if matches!(message, Message::Gossip(_)) {
+            self.stats.payload_messages_received += 1;
+        } else {
+            self.stats.control_messages_received += 1;
+        }
         match message {
             Message::Gossip(details) => self.on_gossip(sender, details, io),
             Message::Prune => self.on_prune(sender),
@@ -344,8 +363,8 @@ impl<PA: PeerAddress> State<PA> {
 
     /// Moves peer into eager set.
     fn add_eager(&mut self, peer: PA) {
-        self.lazy_push_peers.remove(&peer);
         self.eager_push_peers.insert(peer);
+        self.lazy_push_peers.remove(&peer);
     }
 
     /// Moves peer into lazy set.
