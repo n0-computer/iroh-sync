@@ -556,12 +556,7 @@ where
         }
     }
 
-    fn add_active_unchecked(
-        &mut self,
-        peer: PA,
-        priority: Priority,
-        io: &mut impl IO<PA>,
-    ) {
+    fn add_active_unchecked(&mut self, peer: PA, priority: Priority, io: &mut impl IO<PA>) {
         self.passive_view.remove(&peer);
         self.active_view.insert(peer);
         debug!(peer = ?self.me, other = ?peer, "add to active view");
