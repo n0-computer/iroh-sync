@@ -9,8 +9,8 @@ use bytes::Bytes;
 use derive_more::From;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-mod hyparview;
-mod plumtree;
+pub mod hyparview;
+pub mod plumtree;
 mod util;
 
 use hyparview::InEvent as SwarmIn;
@@ -236,15 +236,18 @@ pub struct Stats {
 mod test {
     use std::{
         collections::{BTreeMap, HashMap, HashSet, VecDeque},
+        env,
         time::{Duration, Instant},
     };
 
-    use tracing::debug;
+    use bytes::Bytes;
+    use tracing::{debug, warn};
 
     use super::{Command, Config, Event, InEvent, OutEvent, PeerAddress, State, Timer};
 
     #[test]
     fn hyparview_smoke() {
+        // tracing_subscriber::fmt::init();
         // Create a network with 4 nodes and active_view_capacity 2
         let mut config = Config::default();
         config.membership.active_view_capacity = 2;
@@ -257,7 +260,7 @@ mod test {
         network.command(0, Command::Join(1));
         network.command(0, Command::Join(2));
         network.command(1, Command::Join(2));
-        network.ticks(3);
+        network.ticks(10);
 
         // Confirm emitted events
         let actual = network.events_sorted();
@@ -277,11 +280,12 @@ mod test {
         // Now let node 3 join node 0.
         // Node 0 is full, so it will disconnect from either node 1 or node 2.
         network.command(3, Command::Join(0));
-        network.ticks(3);
+        network.ticks(8);
 
         // Confirm emitted events. There's two options because whether node 0 disconnects from
         // node 1 or node 2 is random.
         let actual = network.events_sorted();
+        eprintln!("actual {actual:?}");
         let expected1 = sort(vec![
             (3, Event::NeighborUp(0)),
             (0, Event::NeighborUp(3)),
@@ -302,12 +306,16 @@ mod test {
         } else {
             assert_eq!(network.conns(), vec![(0, 1), (0, 3), (1, 2)]);
         }
+        assert!(assert_synchronous_active(&network));
     }
 
     #[test]
     fn plumtree_smoke() {
+        tracing_subscriber::fmt::init();
         let config = Config::default();
         let mut network = Network::new(Instant::now());
+        let broadcast_ticks = 12;
+        let join_ticks = 12;
         // build a network with 6 nodes
         for i in 0..6 {
             network.push(State::new(i, config.clone()));
@@ -317,37 +325,166 @@ mod test {
         (1..3).for_each(|i| network.command(i, Command::Join(0)));
         // connect nodes 4 and 5 to node 3
         (4..6).for_each(|i| network.command(i, Command::Join(3)));
-        // run 3 ticks and drain events
-        network.ticks(3);
+        // run ticks and drain events
+        network.ticks(join_ticks);
         let _ = network.events();
+        assert!(assert_synchronous_active(&network));
 
         // now broadcast a first message
         network.command(1, Command::Broadcast(b"hi1".to_vec().into()));
-        network.ticks(3);
+        network.ticks(broadcast_ticks);
         let events = network.events();
         let received: Vec<_> = events
             .filter(|x| matches!(x, (_, Event::Received(_))))
             .collect();
         // message should be received by two other nodes
         assert_eq!(received.len(), 2);
+        assert!(assert_synchronous_active(&network));
 
         // now connect the two sections of the swarm
         network.command(2, Command::Join(5));
-        network.ticks(3);
+        network.ticks(join_ticks);
         let _ = network.events();
+        report_round_distribution(&network);
 
         // now broadcast again
         network.command(1, Command::Broadcast(b"hi2".to_vec().into()));
-        network.ticks(4);
+        network.ticks(broadcast_ticks);
         let events = network.events();
         let received: Vec<_> = events
             .filter(|x| matches!(x, (_, Event::Received(_))))
             .collect();
         // message should be received by all 5 other nodes
         assert_eq!(received.len(), 5);
+        assert!(assert_synchronous_active(&network));
+        report_round_distribution(&network);
     }
 
-    pub const TICK_DURATION: Duration = Duration::from_millis(50);
+    #[test]
+    fn hyparview_big() {
+        // tracing_subscriber::fmt::init();
+        let config = Config::default();
+
+        let len: usize = env::var("PEERS")
+            .unwrap_or_else(|_| "1000".to_string())
+            .parse()
+            .unwrap();
+        let bootstrap_count = 5;
+        let bootstrap_ticks = 50;
+        let join_ticks = 1;
+        let warmup = 200;
+        let rounds = 10;
+        let round_max_ticks = 50;
+        let teardown_ticks = 10;
+
+        // create nodes
+        let mut network = Network::new(Instant::now());
+        for i in 0..len {
+            network.push(State::new(i, config.clone()));
+        }
+
+        // bootstrap nodes
+        for i in 1..bootstrap_count {
+            network.command(i, Command::Join(0));
+        }
+        network.ticks(bootstrap_ticks);
+        let _ = network.events();
+
+        // warmup
+        for i in bootstrap_count..len {
+            let contact = i % bootstrap_count;
+            network.command(i, Command::Join(contact));
+            network.ticks(join_ticks);
+        }
+
+        network.ticks(warmup);
+        let _ = network.events();
+        assert!(assert_synchronous_active(&network));
+
+        for round in 0..rounds {
+            run_round(
+                &mut network,
+                len / rounds,
+                vec![round as u8],
+                round_max_ticks,
+            );
+        }
+        network.ticks(teardown_ticks);
+        assert!(assert_synchronous_active(&network));
+
+        fn run_round(
+            network: &mut Network<usize>,
+            from: usize,
+            message: Vec<u8>,
+            max_ticks: usize,
+        ) {
+            eprintln!("round {:?}", message[0]);
+            let mut expected: HashSet<usize> =
+                HashSet::from_iter(network.peers.keys().filter(|p| **p != from).cloned());
+            let message: Bytes = message.into();
+            network.command(from, Command::Broadcast(message.clone()));
+            for i in 0..max_ticks {
+                if expected.is_empty() {
+                    break;
+                }
+                network.tick();
+                let events = network.events();
+                let received: HashSet<_> = events
+                    .filter(|(_peer, event)| match event {
+                        Event::Received(recv) if recv == &message => true,
+                        _ => false,
+                    })
+                    .map(|(peer, _msg)| peer)
+                    .collect();
+                for peer in received.iter() {
+                    expected.remove(peer);
+                }
+                eprintln!(
+                    "tick {i:3} received {:5} remaining {:5} ",
+                    received.len(),
+                    expected.len(),
+                );
+            }
+
+            assert!(expected.is_empty(), "all nodes received the broadcast");
+            report_round_distribution(&network);
+        }
+    }
+
+    fn report_round_distribution<PA: PeerAddress>(network: &Network<PA>) {
+        let mut eager_distrib: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut lazy_distrib: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut active_distrib: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut passive_distrib: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut payload_recv = 0;
+        let mut control_recv = 0;
+        for (_peer, state) in network.peers.iter() {
+            let stats = state.gossip.stats();
+            *eager_distrib
+                .entry(state.gossip.eager_push_peers.len())
+                .or_default() += 1;
+            *lazy_distrib
+                .entry(state.gossip.lazy_push_peers.len())
+                .or_default() += 1;
+            *active_distrib
+                .entry(state.swarm.active_view().count())
+                .or_default() += 1;
+            *passive_distrib
+                .entry(state.swarm.passive_view().count())
+                .or_default() += 1;
+            payload_recv += stats.payload_messages_received;
+            control_recv += stats.control_messages_received;
+        }
+        // eprintln!("distributions {round_distrib:?}");
+        eprintln!("payload_recv {payload_recv} control_recv {control_recv}");
+        eprintln!("eager_distrib {eager_distrib:?}");
+        eprintln!("lazy_distrib {lazy_distrib:?}");
+        eprintln!("active_distrib {active_distrib:?}");
+        eprintln!("passive_distrib {passive_distrib:?}");
+    }
+
+    const TICK_DURATION: Duration = Duration::from_millis(10);
+    const DEFAULT_LATENCY: Duration = TICK_DURATION.saturating_mul(3);
 
     /// Test network implementation.
     /// Stores events in VecDeques and processes on ticks.
@@ -358,12 +495,13 @@ mod test {
         start: Instant,
         time: Instant,
         tick_duration: Duration,
-        outqueue: Vec<(PA, OutEvent<PA>)>,
         inqueues: HashMap<PA, VecDeque<InEvent<PA>>>,
         peers: HashMap<PA, State<PA>>,
         conns: HashSet<ConnId<PA>>,
         events: VecDeque<(PA, Event<PA>)>,
-        timers: TimerMap<(PA, Timer)>,
+        timers: TimerMap<(PA, Timer<PA>)>,
+        transport: TimerMap<(PA, InEvent<PA>)>,
+        latencies: HashMap<ConnId<PA>, Duration>,
     }
     impl<PA> Network<PA> {
         pub fn new(time: Instant) -> Self {
@@ -371,12 +509,13 @@ mod test {
                 start: time,
                 time,
                 tick_duration: TICK_DURATION,
-                outqueue: Default::default(),
                 inqueues: Default::default(),
                 peers: Default::default(),
                 conns: Default::default(),
                 events: Default::default(),
                 timers: TimerMap::new(),
+                transport: TimerMap::new(),
+                latencies: HashMap::new(),
             }
         }
     }
@@ -422,43 +561,97 @@ mod test {
 
         pub fn tick(&mut self) {
             self.time += self.tick_duration;
-            debug!(tick = self.get_tick(), "~~ TICK");
+
             // process timers
             for (_time, (peer, timer)) in self.timers.drain_until(&self.time) {
                 push_back(&mut self.inqueues, &peer, InEvent::TimerExpired(timer));
             }
-            // process inqueues
+
+            // move messages
+            for (_time, (peer, event)) in self.transport.drain_until(&self.time) {
+                push_back(&mut self.inqueues, &peer, event);
+            }
+
+            // process inqueues: let peer handle all incoming events
+            let mut messages_sent = 0;
             for (peer, queue) in self.inqueues.iter_mut() {
+                let peer = *peer;
                 let state = self.peers.get_mut(&peer).unwrap();
                 while let Some(event) = queue.pop_front() {
-                    debug!(peer = ?peer, "handle {event:?}");
-                    let out = state.handle(event);
-                    self.outqueue.extend(out.map(|ev| (*peer, ev)));
+                    match &event {
+                        InEvent::RecvMessage(from, _mesage) => {
+                            self.conns.insert((*from, peer).into());
+                        }
+                        _ => {}
+                    }
+                    debug!(peer = ?peer, "IN  {event:?}");
+                    let out = state.handle(event, self.time);
+                    for event in out {
+                        debug!(peer = ?peer, "OUT {event:?}");
+                        match event {
+                            OutEvent::SendMessage(to, message) => {
+                                let latency = latency_between(&mut self.latencies, &peer, &to);
+                                self.transport.insert(
+                                    self.time + latency,
+                                    (to, InEvent::RecvMessage(peer, message)),
+                                );
+                                messages_sent += 1;
+                            }
+                            OutEvent::ScheduleTimer(latency, timer) => {
+                                self.timers.insert(self.time + latency, (peer, timer));
+                            }
+                            OutEvent::DisconnectPeer(to) => {
+                                debug!(peer = ?peer, other = ?to, "disconnect");
+                                let latency = latency_between(&mut self.latencies, &peer, &to)
+                                    + Duration::from_nanos(1);
+                                if self.conns.remove(&(peer, to).into()) {
+                                    self.transport.insert(
+                                        self.time + latency,
+                                        (to, InEvent::PeerDisconnected(peer)),
+                                    );
+                                }
+                            }
+                            OutEvent::EmitEvent(event) => {
+                                debug!(peer = ?peer, "emit   {event:?}");
+                                self.events.push_back((peer, event));
+                            }
+                        }
+                    }
                 }
             }
-            // process outqueue
-            for (from, event) in self.outqueue.drain(..) {
-                match event {
-                    OutEvent::SendMessage(to, message) => {
-                        self.conns.insert((from, to).into());
-                        push_back(&mut self.inqueues, &to, InEvent::RecvMessage(from, message));
-                    }
-                    OutEvent::ScheduleTimer(delay, timer) => {
-                        self.timers.insert(self.time + delay, (from, timer));
-                    }
-                    OutEvent::DisconnectPeer(to) => {
-                        debug!(peer = ?from, other = ?to, "disconnect");
-                        self.conns.remove(&(from, to).into());
-                        push_back(&mut self.inqueues, &from, InEvent::PeerDisconnected(to));
-                        push_back(&mut self.inqueues, &to, InEvent::PeerDisconnected(from));
-                    }
-                    OutEvent::EmitEvent(event) => {
-                        debug!(peer = ?from, "emit   {event:?}");
-                        self.events.push_back((from, event));
-                    }
+            debug!(
+                tick = self.get_tick(),
+                "~~ TICK (messages sent: {messages_sent})"
+            );
+        }
+    }
+
+    fn latency_between<PA: PeerAddress>(
+        _latencies: &mut HashMap<ConnId<PA>, Duration>,
+        _a: &PA,
+        _b: &PA,
+    ) -> Duration {
+        DEFAULT_LATENCY
+    }
+
+    fn assert_synchronous_active<PA: PeerAddress>(network: &Network<PA>) -> bool {
+        for (peer, state) in network.peers.iter() {
+            for other in state.swarm.active_view.iter() {
+                let other_state = &network.peers.get(other).unwrap().swarm.active_view;
+                if !other_state.contains(&peer) {
+                    warn!(peer = ?peer, other = ?other, "missing active_view peer in other");
+                    return false;
+                }
+            }
+            for other in state.gossip.eager_push_peers.iter() {
+                let other_state = &network.peers.get(other).unwrap().gossip.eager_push_peers;
+                if !other_state.contains(&peer) {
+                    warn!(peer = ?peer, other = ?other, "missing eager_push peer in other");
+                    return false;
                 }
             }
         }
+        true
     }
 
     /// A BtreeMap with Instant as key. Allows to process expired items.
