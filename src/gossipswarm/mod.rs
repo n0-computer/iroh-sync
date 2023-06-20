@@ -143,8 +143,8 @@ impl<PA: PeerAddress> State<PA> {
     /// Initialize the local state.
     pub fn new(me: PA, config: Config) -> Self {
         Self {
-            swarm: hyparview::State::new(me.clone(), config.membership),
-            gossip: plumtree::State::new(me.clone(), config.broadcast),
+            swarm: hyparview::State::new(me, config.membership),
+            gossip: plumtree::State::new(me, config.broadcast),
             me,
             outbox: VecDeque::new(),
             stats: Stats::default(),
@@ -159,12 +159,11 @@ impl<PA: PeerAddress> State<PA> {
     /// Handle an incoming event.
     ///
     /// Returns an iterator of outgoing events that must be processed by the application.
-    #[must_use]
-    pub fn handle<'a>(
-        &'a mut self,
+    pub fn handle(
+        &mut self,
         event: InEvent<PA>,
         now: Instant,
-    ) -> impl Iterator<Item = OutEvent<PA>> + 'a {
+    ) -> impl Iterator<Item = OutEvent<PA>> + '_ {
         let io = &mut self.outbox;
         // Process the event, store out events in outbox.
         match event {
@@ -198,12 +197,12 @@ impl<PA: PeerAddress> State<PA> {
         let mut io = VecDeque::new();
         for event in self.outbox.iter() {
             match event {
-                OutEvent::EmitEvent(Event::NeighborUp(peer)) => self
-                    .gossip
-                    .handle(GossipIn::NeighborUp(peer.clone()), &mut io),
-                OutEvent::EmitEvent(Event::NeighborDown(peer)) => self
-                    .gossip
-                    .handle(GossipIn::NeighborDown(peer.clone()), &mut io),
+                OutEvent::EmitEvent(Event::NeighborUp(peer)) => {
+                    self.gossip.handle(GossipIn::NeighborUp(*peer), &mut io)
+                }
+                OutEvent::EmitEvent(Event::NeighborDown(peer)) => {
+                    self.gossip.handle(GossipIn::NeighborDown(*peer), &mut io)
+                }
                 _ => {}
             }
         }
@@ -430,10 +429,7 @@ mod test {
                 network.tick();
                 let events = network.events();
                 let received: HashSet<_> = events
-                    .filter(|(_peer, event)| match event {
-                        Event::Received(recv) if recv == &message => true,
-                        _ => false,
-                    })
+                    .filter(|(_peer, event)| matches!(event,  Event::Received(recv) if recv == &message))
                     .map(|(peer, _msg)| peer)
                     .collect();
                 for peer in received.iter() {
@@ -447,7 +443,7 @@ mod test {
             }
 
             assert!(expected.is_empty(), "all nodes received the broadcast");
-            report_round_distribution(&network);
+            report_round_distribution(network);
         }
     }
 
@@ -525,7 +521,7 @@ mod test {
         peer: &PA,
         event: InEvent<PA>,
     ) {
-        inqueues.get_mut(&peer).unwrap().push_back(event);
+        inqueues.get_mut(peer).unwrap().push_back(event);
     }
 
     impl<PA: PeerAddress + Ord> Network<PA> {
@@ -534,7 +530,7 @@ mod test {
             self.peers.insert(*peer.endpoint(), peer);
         }
 
-        pub fn events<'a>(&'a mut self) -> impl Iterator<Item = (PA, Event<PA>)> + 'a {
+        pub fn events(&mut self) -> impl Iterator<Item = (PA, Event<PA>)> + '_ {
             self.events.drain(..)
         }
 
@@ -638,14 +634,14 @@ mod test {
         for (peer, state) in network.peers.iter() {
             for other in state.swarm.active_view.iter() {
                 let other_state = &network.peers.get(other).unwrap().swarm.active_view;
-                if !other_state.contains(&peer) {
+                if !other_state.contains(peer) {
                     warn!(peer = ?peer, other = ?other, "missing active_view peer in other");
                     return false;
                 }
             }
             for other in state.gossip.eager_push_peers.iter() {
                 let other_state = &network.peers.get(other).unwrap().gossip.eager_push_peers;
-                if !other_state.contains(&peer) {
+                if !other_state.contains(peer) {
                     warn!(peer = ?peer, other = ?other, "missing eager_push peer in other");
                     return false;
                 }
@@ -665,13 +661,12 @@ mod test {
             entry.push(item);
         }
         pub fn drain_until(&mut self, from: &Instant) -> impl Iterator<Item = (Instant, T)> {
-            let split_point = from.clone() + Duration::from_nanos(1);
+            let split_point = *from + Duration::from_nanos(1);
             let later_half = self.0.split_off(&split_point);
             let expired = std::mem::replace(&mut self.0, later_half);
             expired
                 .into_iter()
-                .map(|(t, v)| v.into_iter().map(move |v| (t, v)))
-                .flatten()
+                .flat_map(|(t, v)| v.into_iter().map(move |v| (t, v)))
         }
     }
 
@@ -697,7 +692,7 @@ mod test {
     }
 
     fn sort<T: Ord + Clone>(items: Vec<T>) -> Vec<T> {
-        let mut sorted = items.clone();
+        let mut sorted = items;
         sorted.sort();
         sorted
     }

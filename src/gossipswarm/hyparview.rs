@@ -105,8 +105,8 @@ pub enum Priority {
     Low,
 }
 
-impl<PA: Hash + Eq> ShuffleReply<PA> {
-    pub fn from_iter(nodes: impl IntoIterator<Item = PA>) -> Self {
+impl<PA: Hash + Eq> FromIterator<PA> for ShuffleReply<PA> {
+    fn from_iter<I: IntoIterator<Item = PA>>(nodes: I) -> Self {
         Self {
             nodes: HashSet::<PA>::from_iter(nodes.into_iter())
                 .into_iter()
@@ -354,18 +354,16 @@ where
             let nodes = self.passive_view.shuffled_max(len, &mut self.rng);
             let message = Message::ShuffleReply(ShuffleReply::from_iter(nodes));
             io.push(OutEvent::SendMessage(shuffle.origin, message));
-        } else {
-            if let Some(node) = self
-                .active_view
-                .pick_random_without(&[&shuffle.origin, &from], &mut self.rng)
-            {
-                let message = Message::Shuffle(Shuffle {
-                    origin: shuffle.origin,
-                    nodes: shuffle.nodes,
-                    ttl: shuffle.ttl.next(),
-                });
-                io.push(OutEvent::SendMessage(*node, message));
-            }
+        } else if let Some(node) = self
+            .active_view
+            .pick_random_without(&[&shuffle.origin, &from], &mut self.rng)
+        {
+            let message = Message::Shuffle(Shuffle {
+                origin: shuffle.origin,
+                nodes: shuffle.nodes,
+                ttl: shuffle.ttl.next(),
+            });
+            io.push(OutEvent::SendMessage(*node, message));
         }
     }
 
@@ -388,12 +386,12 @@ where
     fn handle_shuffle_timer(&mut self, io: &mut impl IO<PA>) {
         if let Some(node) = self.active_view.pick_random(&mut self.rng) {
             let active = self.active_view.shuffled_without_max(
-                &[&node],
+                &[node],
                 self.config.shuffle_active_view_count,
                 &mut self.rng,
             );
             let passive = self.passive_view.shuffled_without_max(
-                &[&node],
+                &[node],
                 self.config.shuffle_passive_view_count,
                 &mut self.rng,
             );
@@ -401,7 +399,7 @@ where
             nodes.extend(active);
             nodes.extend(passive);
             let message = Shuffle {
-                origin: self.me.clone(),
+                origin: self.me,
                 nodes,
                 ttl: self.config.shuffle_random_walk_length,
             };
@@ -440,14 +438,14 @@ where
     ///
     /// If respond is true, a Disconnect message will be sent to the peer.
     fn remove_active(&mut self, peer: &PA, respond: Respond, io: &mut impl IO<PA>) -> Option<PA> {
-        self.active_view.get_index_of(peer).and_then(|idx| {
+        self.active_view.get_index_of(peer).map(|idx| {
             let removed_peer = self
                 .remove_active_by_index(idx, respond, RemovalReason::Disconnect, io)
                 .unwrap();
 
             self.refill_active_from_passive(&[&removed_peer], io);
 
-            Some(removed_peer)
+            removed_peer
         })
     }
 

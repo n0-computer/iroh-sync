@@ -47,7 +47,7 @@ pub enum Event {
 }
 
 /// A message identifier, which is the message content's blake3 hash
-#[derive(Serialize, Deserialize, Clone, Copy, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Eq)]
 pub struct MessageId([u8; 32]);
 
 impl From<blake3::Hash> for MessageId {
@@ -59,6 +59,12 @@ impl From<blake3::Hash> for MessageId {
 impl std::hash::Hash for MessageId {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         state.write(&self.0);
+    }
+}
+
+impl PartialEq for MessageId {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
     }
 }
 
@@ -201,7 +207,7 @@ impl<PA: PeerAddress> State<PA> {
             InEvent::TimerExpired(timer) => match timer {
                 Timer::DispatchLazyPush => self.on_dispatch_timer(io),
                 Timer::SendGraft(id) => {
-                    self.on_send_graft_timer(id.clone(), io);
+                    self.on_send_graft_timer(id, io);
                 }
             },
         }
@@ -248,14 +254,14 @@ impl<PA: PeerAddress> State<PA> {
         self.cache.insert(id, message.clone());
         let me = self.me;
         self.eager_push(message.clone(), &me, io);
-        self.lazy_push(message.clone(), &me, io);
+        self.lazy_push(message, &me, io);
     }
 
     fn on_gossip(&mut self, sender: PA, message: Gossip, io: &mut impl IO<PA>) {
         // if we already received this message: move peer to lazy set
         // and notify peer about this.
         if self.received_messages.contains(&message.id) {
-            self.add_lazy(sender.clone());
+            self.add_lazy(sender);
             io.push(OutEvent::SendMessage(sender, Message::Prune));
         // otherwise store the message, emit to application and forward to peers
         } else {
