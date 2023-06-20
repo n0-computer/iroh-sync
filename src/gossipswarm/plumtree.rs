@@ -154,8 +154,8 @@ impl Default for Config {
 
 #[derive(Debug, Default, Clone)]
 pub struct Stats {
-    pub payload_messages_received: u16,
-    pub control_messages_received: u16,
+    pub payload_messages_received: u64,
+    pub control_messages_received: u64,
 }
 
 #[derive(Debug)]
