@@ -418,8 +418,13 @@ mod test {
             max_ticks: usize,
         ) {
             eprintln!("round {:?}", message[0]);
-            let mut expected: HashSet<usize> =
-                HashSet::from_iter(network.peers.iter().map(|p| *p.endpoint()));
+            let mut expected: HashSet<usize> = HashSet::from_iter(
+                network
+                    .peers
+                    .iter()
+                    .map(|p| *p.endpoint())
+                    .filter(|p| *p != from),
+            );
             let message: Bytes = message.into();
             network.command(from, Command::Broadcast(message.clone()));
             for i in 0..max_ticks {
