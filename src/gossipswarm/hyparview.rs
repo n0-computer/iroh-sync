@@ -176,29 +176,24 @@ pub struct State<PA, RG = ThreadRng> {
     pending_neighbor_requests: HashSet<PA>,
 }
 
-impl<PA> State<PA, rand::rngs::OsRng>
+impl<PA, RG> State<PA, RG>
 where
     PA: PeerAddress,
+    RG: Rng,
 {
-    pub fn new(me: PA, config: Config) -> Self {
+    pub fn new(me: PA, config: Config, rng: RG) -> Self {
         Self {
             me,
             active_view: IndexSet::new(),
             passive_view: IndexSet::new(),
             config,
             shuffle_scheduled: false,
-            rng: rand::rngs::OsRng,
+            rng,
             stats: Stats::default(),
             pending_neighbor_requests: Default::default(),
         }
     }
-}
 
-impl<PA, RG> State<PA, RG>
-where
-    PA: PeerAddress,
-    RG: Rng,
-{
     pub fn handle(&mut self, event: InEvent<PA>, now: Instant, io: &mut impl IO<PA>) {
         match event {
             InEvent::RecvMessage(from, message) => self.handle_message(from, message, now, io),

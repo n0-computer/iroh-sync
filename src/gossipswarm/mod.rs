@@ -7,6 +7,8 @@ use std::{
 
 use bytes::Bytes;
 use derive_more::From;
+use rand::Rng;
+use rand_core::SeedableRng;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub mod hyparview;
@@ -131,29 +133,38 @@ pub struct Config {
 /// The Gossipswarm maintains the state of peer network and sends and receives gossip messages over
 /// the swarm.
 #[derive(Debug)]
-pub struct State<PA> {
+pub struct State<PA, R> {
     me: PA,
-    swarm: hyparview::State<PA, rand::rngs::OsRng>,
+    swarm: hyparview::State<PA, R>,
     gossip: plumtree::State<PA>,
     outbox: VecDeque<OutEvent<PA>>,
     stats: Stats,
 }
 
-impl<PA: PeerAddress> State<PA> {
-    /// Initialize the local state.
+impl<PA: PeerAddress> State<PA, rand::rngs::StdRng> {
+    /// Initialize the local state with the default random number generator.
     pub fn new(me: PA, config: Config) -> Self {
+        Self::with_rng(me, config, rand::rngs::StdRng::from_entropy())
+    }
+}
+
+impl<PA, R> State<PA, R> {
+    /// The address of your local endpoint.
+    pub fn endpoint(&self) -> &PA {
+        &self.me
+    }
+}
+
+impl<PA: PeerAddress, R: Rng> State<PA, R> {
+    /// Initialize the local state with a custom random number generator.
+    pub fn with_rng(me: PA, config: Config, rng: R) -> Self {
         Self {
-            swarm: hyparview::State::new(me, config.membership),
+            swarm: hyparview::State::new(me, config.membership, rng),
             gossip: plumtree::State::new(me, config.broadcast),
             me,
             outbox: VecDeque::new(),
             stats: Stats::default(),
         }
-    }
-
-    /// The address of your local endpoint.
-    pub fn endpoint(&self) -> &PA {
-        &self.me
     }
 
     /// Handle an incoming event.
@@ -240,6 +251,8 @@ mod test {
     };
 
     use bytes::Bytes;
+    use rand::Rng;
+    use rand_core::SeedableRng;
     use tracing::{debug, warn};
 
     use super::{Command, Config, Event, InEvent, OutEvent, PeerAddress, State, Timer};
