@@ -14,7 +14,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use derive_more::From;
+use derive_more::{Add, From, Sub};
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
 
@@ -83,7 +83,9 @@ impl fmt::Debug for MessageId {
     }
 }
 
-#[derive(From, Serialize, Deserialize, Eq, PartialEq, Clone, Copy, Debug, Hash)]
+#[derive(
+    From, Add, Sub, Serialize, Deserialize, Eq, PartialEq, PartialOrd, Ord, Clone, Copy, Debug, Hash,
+)]
 pub struct Round(u16);
 
 impl Round {
@@ -131,23 +133,24 @@ pub struct IHave {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Graft {
-    id: MessageId,
+    id: Option<MessageId>,
     round: Round,
 }
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    graft_timeout_1: Duration,
-    graft_timeout_2: Duration,
-    dispatch_timeout: Duration,
-    // optimization_threshold: Round,
+    pub graft_timeout_1: Duration,
+    pub graft_timeout_2: Duration,
+    pub dispatch_timeout: Duration,
+    pub optimization_threshold: Round,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
             graft_timeout_1: Duration::from_millis(80),
             graft_timeout_2: Duration::from_secs(40),
-            dispatch_timeout: Duration::from_millis(20), // optimization_threshold: Round(5),
+            dispatch_timeout: Duration::from_millis(50),
+            optimization_threshold: Round(7),
         }
     }
 }
@@ -156,6 +159,7 @@ impl Default for Config {
 pub struct Stats {
     pub payload_messages_received: u64,
     pub control_messages_received: u64,
+    pub max_last_delivery_hop: u16,
 }
 
 #[derive(Debug)]
@@ -175,7 +179,7 @@ pub struct State<PA> {
     graft_timer_scheduled: HashSet<MessageId>,
     dispatch_timer_scheduled: bool,
 
-    stats: Stats,
+    pub(crate) stats: Stats,
 }
 
 impl<PA: PeerAddress> State<PA> {
@@ -265,10 +269,6 @@ impl<PA: PeerAddress> State<PA> {
             io.push(OutEvent::SendMessage(sender, Message::Prune));
         // otherwise store the message, emit to application and forward to peers
         } else {
-            // cleanup places where we track missing messages
-            self.missing_messages.remove(&message.id);
-            self.graft_timer_scheduled.remove(&message.id);
-
             // insert the message in the list of received messages
             self.received_messages.insert(message.id);
 
@@ -283,10 +283,45 @@ impl<PA: PeerAddress> State<PA> {
             self.eager_push(message.clone(), &sender, io);
             self.lazy_push(message.clone(), &sender, io);
 
+            // cleanup places where we track missing messages
+            self.graft_timer_scheduled.remove(&message.id);
+            let previous_ihaves = self.missing_messages.remove(&message.id);
+            // do the optimization step from the paper
+            if let Some(previous_ihaves) = previous_ihaves {
+                self.optimize_tree(&sender, &message, previous_ihaves, io);
+            }
+
             // emit event to application
             io.push(OutEvent::EmitEvent(Event::Received(message.content)));
 
-            // TODO: optimize (optional)
+            self.stats.max_last_delivery_hop =
+                self.stats.max_last_delivery_hop.max(message.round.0);
+        }
+    }
+
+    fn optimize_tree(
+        &mut self,
+        sender: &PA,
+        message: &Gossip,
+        previous_ihaves: VecDeque<(PA, Round)>,
+        io: &mut impl IO<PA>,
+    ) {
+        let round = message.round;
+        let best_ihave = previous_ihaves
+            .iter()
+            .min_by(|(_froma, ra), (_fromb, rb)| ra.cmp(rb))
+            .map(|x| *x);
+
+        if let Some((ihave_node, ihave_round)) = best_ihave {
+            if (ihave_round < round) && (round - ihave_round) >= self.config.optimization_threshold
+            {
+                let message = Message::Graft(Graft {
+                    id: None,
+                    round: ihave_round,
+                });
+                io.push(OutEvent::SendMessage(ihave_node, message));
+                io.push(OutEvent::SendMessage(*sender, Message::Prune));
+            }
         }
     }
 
@@ -328,7 +363,10 @@ impl<PA: PeerAddress> State<PA> {
             .and_then(|entries| entries.pop_front());
         if let Some((peer, round)) = entry {
             self.add_eager(peer);
-            let message = Message::Graft(Graft { id, round });
+            let message = Message::Graft(Graft {
+                id: Some(id),
+                round,
+            });
             io.push(OutEvent::SendMessage(peer, message));
 
             // "when a GRAFT message is sent, another timer is started to expire after a certain timeout,
@@ -344,11 +382,13 @@ impl<PA: PeerAddress> State<PA> {
 
     fn on_graft(&mut self, sender: PA, details: Graft, io: &mut impl IO<PA>) {
         self.add_eager(sender);
-        if let Some(message) = self.cache.get(&details.id) {
-            io.push(OutEvent::SendMessage(
-                sender,
-                Message::Gossip(message.clone()),
-            ));
+        if let Some(id) = details.id {
+            if let Some(message) = self.cache.get(&id) {
+                io.push(OutEvent::SendMessage(
+                    sender,
+                    Message::Gossip(message.clone()),
+                ));
+            }
         }
     }
 
