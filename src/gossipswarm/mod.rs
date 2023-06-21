@@ -372,100 +372,52 @@ mod test {
         report_round_distribution(&network);
     }
 
-    #[test]
-    fn hyparview_big() {
-        // tracing_subscriber::fmt::init();
-        let config = Config::default();
-
-        let len: usize = env::var("PEERS")
-            .unwrap_or_else(|_| "1000".to_string())
+    fn read_var(name: &str, default: usize) -> usize {
+        env::var(name)
+            .unwrap_or_else(|_| default.to_string())
             .parse()
-            .unwrap();
-        let bootstrap_count = 5;
-        let bootstrap_ticks = 50;
-        let join_ticks = 1;
-        let warmup = 200;
-        let rounds = 10;
-        let round_max_ticks = 50;
-        let teardown_ticks = 10;
-
-        // create nodes
-        let mut network = Network::new(Instant::now());
-        for i in 0..len {
-            network.push(State::new(i, config.clone()));
-        }
-
-        // bootstrap nodes
-        for i in 1..bootstrap_count {
-            network.command(i, Command::Join(0));
-        }
-        network.ticks(bootstrap_ticks);
-        let _ = network.events();
-
-        // warmup
-        for i in bootstrap_count..len {
-            let contact = i % bootstrap_count;
-            network.command(i, Command::Join(contact));
-            network.ticks(join_ticks);
-        }
-
-        network.ticks(warmup);
-        let _ = network.events();
-        assert!(assert_synchronous_active(&network));
-
-        for round in 0..rounds {
-            run_round(
-                &mut network,
-                len / rounds,
-                vec![round as u8],
-                round_max_ticks,
-            );
-        }
-        network.ticks(teardown_ticks);
-        assert!(assert_synchronous_active(&network));
-
-        fn run_round(
-            network: &mut Network<usize>,
-            from: usize,
-            message: Vec<u8>,
-            max_ticks: usize,
-        ) {
-            eprintln!("round {:?}", message[0]);
-            let mut expected: HashSet<usize> = HashSet::from_iter(
-                network
-                    .peers
-                    .iter()
-                    .map(|p| *p.endpoint())
-                    .filter(|p| *p != from),
-            );
-            let message: Bytes = message.into();
-            network.command(from, Command::Broadcast(message.clone()));
-            for i in 0..max_ticks {
-                if expected.is_empty() {
-                    break;
-                }
-                network.tick();
-                let events = network.events();
-                let received: HashSet<_> = events
-                .filter(|(_peer, event)| matches!(event,  Event::Received(recv) if recv == &message))
-                .map(|(peer, _msg)| peer)
-                .collect();
-                for peer in received.iter() {
-                    expected.remove(peer);
-                }
-                eprintln!(
-                    "tick {i:3} received {:5} remaining {:5} ",
-                    received.len(),
-                    expected.len(),
-                );
-            }
-
-            assert!(expected.is_empty(), "all nodes received the broadcast");
-            report_round_distribution(network);
-        }
+            .unwrap()
     }
 
-    fn report_round_distribution<PA: PeerAddress>(network: &Network<PA>) {
+    #[test]
+    fn big_multiple_sender() {
+        // tracing_subscriber::fmt::init();
+        let mut gossipswarm_config = Config::default();
+        gossipswarm_config.broadcast.optimization_threshold = (read_var("OPTIM", 7) as u16).into();
+        let mut config = SimulatorConfig::default();
+        config.peers_count = read_var("PEERS", 1000);
+        let rounds = read_var("ROUNDS", 50);
+        let mut simulator = Simulator::new(config, gossipswarm_config);
+        simulator.init();
+        simulator.bootstrap();
+        for i in 0..rounds {
+            let from = i + 1;
+            let message = format!("m{i}").into_bytes().into();
+            simulator.gossip_round(from, message)
+        }
+        simulator.report_round_sums();
+    }
+
+    #[test]
+    fn big_single_sender() {
+        // tracing_subscriber::fmt::init();
+        let mut gossipswarm_config = Config::default();
+        gossipswarm_config.broadcast.optimization_threshold = (read_var("OPTIM", 7) as u16).into();
+        let mut config = SimulatorConfig::default();
+        config.peers_count = read_var("PEERS", 1000);
+        let rounds = read_var("ROUNDS", 50);
+        let mut simulator = Simulator::new(config, gossipswarm_config);
+        simulator.init();
+        simulator.bootstrap();
+        for i in 0..rounds {
+            let from = 2;
+            let message = format!("m{i}").into_bytes().into();
+            simulator.gossip_round(from, message)
+        }
+        simulator.report_round_sums();
+    }
+
+    fn report_round_distribution<PA: PeerAddress, R: Rng>(network: &Network<PA, R>) {
         let mut eager_distrib: BTreeMap<usize, usize> = BTreeMap::new();
         let mut lazy_distrib: BTreeMap<usize, usize> = BTreeMap::new();
         let mut active_distrib: BTreeMap<usize, usize> = BTreeMap::new();
@@ -505,12 +457,12 @@ mod test {
     /// Timers are checked after each tick. The local time is increased with TICK_DURATION before
     /// each tick.
     /// Note: Panics when sending to an unknown peer.
-    struct Network<PA> {
+    struct Network<PA, R> {
         start: Instant,
         time: Instant,
         tick_duration: Duration,
         inqueues: Vec<VecDeque<InEvent<PA>>>,
-        peers: Vec<State<PA>>,
+        peers: Vec<State<PA, R>>,
         peers_by_address: HashMap<PA, usize>,
         conns: HashSet<ConnId<PA>>,
         events: VecDeque<(PA, Event<PA>)>,
@@ -518,7 +470,7 @@ mod test {
         transport: TimerMap<(usize, InEvent<PA>)>,
         latencies: HashMap<ConnId<PA>, Duration>,
     }
-    impl<PA> Network<PA> {
+    impl<PA, R> Network<PA, R> {
         pub fn new(time: Instant) -> Self {
             Self {
                 start: time,
@@ -544,8 +496,8 @@ mod test {
         inqueues.get_mut(peer_pos).unwrap().push_back(event);
     }
 
-    impl<PA: PeerAddress + Ord> Network<PA> {
-        pub fn push(&mut self, peer: State<PA>) {
+    impl<PA: PeerAddress, R: Rng> Network<PA, R> {
+        pub fn push(&mut self, peer: State<PA, R>) {
             let idx = self.inqueues.len();
             self.inqueues.push(VecDeque::new());
             self.peers_by_address.insert(*peer.endpoint(), idx);
@@ -654,7 +606,7 @@ mod test {
         DEFAULT_LATENCY
     }
 
-    fn assert_synchronous_active<PA: PeerAddress>(network: &Network<PA>) -> bool {
+    fn assert_synchronous_active<PA: PeerAddress, R>(network: &Network<PA, R>) -> bool {
         for state in network.peers.iter() {
             let peer = *state.endpoint();
             for other in state.swarm.active_view.iter() {
@@ -681,6 +633,173 @@ mod test {
         }
         true
     }
+
+    type PeerId = usize;
+    struct Simulator {
+        gossipswarm_config: Config,
+        network: Network<PeerId, rand::rngs::StdRng>,
+        config: SimulatorConfig,
+        round_stats: Vec<RoundStats>,
+    }
+    struct SimulatorConfig {
+        peers_count: usize,
+        bootstrap_count: usize,
+        bootstrap_ticks: usize,
+        join_ticks: usize,
+        warmup_ticks: usize,
+        round_max_ticks: usize,
+    }
+    #[derive(Debug, Default)]
+    struct RoundStats {
+        ticks: usize,
+        rmr: f32,
+        ldh: u16,
+    }
+    impl Default for SimulatorConfig {
+        fn default() -> Self {
+            Self {
+                peers_count: 100,
+                bootstrap_count: 5,
+                bootstrap_ticks: 50,
+                join_ticks: 1,
+                warmup_ticks: 300,
+                round_max_ticks: 200,
+            }
+        }
+    }
+    impl Simulator {
+        pub fn new(config: SimulatorConfig, gossipswarm_config: Config) -> Self {
+            Self {
+                gossipswarm_config,
+                config,
+                network: Network::new(Instant::now()),
+                round_stats: Default::default(),
+            }
+        }
+        pub fn init(&mut self) {
+            for i in 0..self.config.peers_count {
+                let rng = rand::rngs::StdRng::seed_from_u64(i as u64);
+                self.network.push(State::with_rng(
+                    i,
+                    self.gossipswarm_config.clone(),
+                    rng.clone(),
+                ));
+            }
+        }
+        pub fn bootstrap(&mut self) {
+            for i in 1..self.config.bootstrap_count {
+                self.network.command(i, Command::Join(0));
+            }
+            self.network.ticks(self.config.bootstrap_ticks);
+            let _ = self.network.events();
+
+            for i in self.config.bootstrap_count..self.config.peers_count {
+                let contact = i % self.config.bootstrap_count;
+                self.network.command(i, Command::Join(contact));
+                self.network.ticks(self.config.join_ticks);
+                let _ = self.network.events();
+            }
+            self.network.ticks(self.config.warmup_ticks);
+            let _ = self.network.events();
+        }
+
+        pub fn gossip_round(&mut self, from: PeerId, message: Bytes) {
+            let prev_total_payload_counter = self.total_payload_messages();
+            let mut expected: HashSet<usize> = HashSet::from_iter(
+                self.network
+                    .peers
+                    .iter()
+                    .map(|p| *p.endpoint())
+                    .filter(|p| *p != from),
+            );
+            let expected_len = expected.len() as u64;
+            self.network
+                .command(from, Command::Broadcast(message.clone()));
+
+            let mut tick = 0;
+            loop {
+                if expected.is_empty() {
+                    break;
+                }
+                if tick > self.config.round_max_ticks {
+                    break;
+                }
+                tick += 1;
+                self.network.tick();
+                let events = self.network.events();
+                let received: HashSet<_> = events
+                    .filter(|(_peer, event)| matches!(event,  Event::Received(recv) if recv == &message))
+                    .map(|(peer, _msg)| peer)
+                    .collect();
+                for peer in received.iter() {
+                    expected.remove(peer);
+                }
+                // eprintln!(
+                //     "tick {tick:3} received {:5} remaining {:5} ",
+                //     received.len(),
+                //     expected.len(),
+                // );
+            }
+
+            assert!(expected.is_empty(), "all nodes received the broadcast");
+            let payload_counter = self.total_payload_messages() - prev_total_payload_counter;
+            let rmr = (payload_counter as f32 / (expected_len as f32 - 1.)) - 1.;
+            let ldh = self.max_ldh();
+            let stats = RoundStats {
+                ticks: tick,
+                rmr,
+                ldh,
+            };
+            self.round_stats.push(stats);
+            self.reset_stats()
+        }
+
+        fn report_round_sums(&self) {
+            let len = self.round_stats.len();
+            let mut rmr = 0.;
+            let mut ldh = 0.;
+            let mut ticks = 0.;
+            for round in self.round_stats.iter() {
+                rmr += round.rmr;
+                ldh += round.ldh as f32;
+                ticks += round.ticks as f32;
+            }
+            rmr = rmr / len as f32;
+            ldh = ldh / len as f32;
+            ticks = ticks / len as f32;
+            eprintln!(
+                "average over {} rounds with {} peers: RMR {rmr:.2} LDH {ldh:.2} ticks {ticks:.2}",
+                self.round_stats.len(),
+                self.network.peers.len(),
+            );
+            eprintln!("RMR = Relative Message Redundancy, LDH = Last Delivery Hop");
+        }
+
+        fn reset_stats(&mut self) {
+            for state in self.network.peers.iter_mut() {
+                state.gossip.stats = Default::default();
+            }
+        }
+
+        fn max_ldh(&self) -> u16 {
+            let mut max = 0;
+            for state in self.network.peers.iter() {
+                let stats = state.gossip.stats();
+                max = max.max(stats.max_last_delivery_hop);
+            }
+            max
+        }
+
+        fn total_payload_messages(&self) -> u64 {
+            let mut sum = 0;
+            for state in self.network.peers.iter() {
+                let stats = state.gossip.stats();
+                sum += stats.payload_messages_received;
+            }
+            sum
+        }
+    }
+
 
     /// A BtreeMap with Instant as key. Allows to process expired items.
     pub struct TimerMap<T>(BTreeMap<Instant, Vec<T>>);
