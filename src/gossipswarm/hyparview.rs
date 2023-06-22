@@ -41,7 +41,7 @@ pub enum Event<PA> {
     NeighborDown(PA),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Timer<PA> {
     DoShuffle,
     PendingNeighborRequest(PA),

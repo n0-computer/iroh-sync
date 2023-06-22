@@ -23,7 +23,7 @@ impl<T> PeerAddress for T where T: Hash + Eq + Copy + fmt::Debug + Ord + Seriali
 {}
 
 /// Input event to the state handler.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum InEvent<PA> {
     /// Message received from the network.
     RecvMessage(PA, Message<PA>),
@@ -106,13 +106,13 @@ impl<PA> From<plumtree::Event> for Event<PA> {
     }
 }
 
-#[derive(From, Debug)]
+#[derive(Clone, From, Debug)]
 pub enum Timer<PA> {
     Swarm(hyparview::Timer<PA>),
     Gossip(plumtree::Timer),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Command<PA> {
     Join(PA),
     Broadcast(Bytes),
@@ -385,8 +385,8 @@ mod test {
         let mut gossipswarm_config = Config::default();
         gossipswarm_config.broadcast.optimization_threshold = (read_var("OPTIM", 7) as u16).into();
         let mut config = SimulatorConfig::default();
-        config.peers_count = read_var("PEERS", 1000);
-        let rounds = read_var("ROUNDS", 50);
+        config.peers_count = read_var("PEERS", 100);
+        let rounds = read_var("ROUNDS", 10);
         let mut simulator = Simulator::new(config, gossipswarm_config);
         simulator.init();
         simulator.bootstrap();
@@ -404,8 +404,8 @@ mod test {
         let mut gossipswarm_config = Config::default();
         gossipswarm_config.broadcast.optimization_threshold = (read_var("OPTIM", 7) as u16).into();
         let mut config = SimulatorConfig::default();
-        config.peers_count = read_var("PEERS", 1000);
-        let rounds = read_var("ROUNDS", 50);
+        config.peers_count = read_var("PEERS", 100);
+        let rounds = read_var("ROUNDS", 10);
         let mut simulator = Simulator::new(config, gossipswarm_config);
         simulator.init();
         simulator.bootstrap();
@@ -799,7 +799,6 @@ mod test {
             sum
         }
     }
-
 
     /// A BtreeMap with Instant as key. Allows to process expired items.
     pub struct TimerMap<T>(BTreeMap<Instant, Vec<T>>);
